@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 )
 
@@ -147,9 +148,13 @@ func (s *Store) RotateAgentToken(ctx context.Context, workspaceID, agentID int64
 	return nil
 }
 
-// TouchAgent records that an agent was just active.
+// TouchAgent records that an agent was just active. It only writes when the old
+// value is a few seconds stale, a disk sync on every tool call would be wasted.
 func (s *Store) TouchAgent(ctx context.Context, agentID int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE agents SET last_seen_at = ? WHERE id = ?`, nowMillis(), agentID)
+	now := nowMillis()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)`,
+		now, agentID, now-10_000)
 	return err
 }
 
@@ -189,35 +194,60 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 // InsertMessage stores a message. A threadID of zero starts a new thread that
 // takes the id of the message itself.
 func (s *Store) InsertMessage(ctx context.Context, workspaceID, threadID, fromID, toID int64, kind, body string, inReplyTo int64) (*Message, error) {
+	m, _, err := s.InsertMessageKeyed(ctx, workspaceID, threadID, fromID, toID, kind, body, inReplyTo, "")
+	return m, err
+}
+
+// MessageByClientKey finds a message the sender already stored under this key.
+func (s *Store) MessageByClientKey(ctx context.Context, fromID int64, clientKey string) (*Message, error) {
+	return scanMessage(s.db.QueryRowContext(ctx,
+		messageSelect+` WHERE m.from_agent_id = ? AND m.client_key = ?`, fromID, clientKey))
+}
+
+// InsertMessageKeyed stores a message unless the sender already stored one under
+// clientKey, in which case it returns that one and false.
+func (s *Store) InsertMessageKeyed(ctx context.Context, workspaceID, threadID, fromID, toID int64, kind, body string, inReplyTo int64, clientKey string) (*Message, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer tx.Rollback()
+	var key any
+	if clientKey != "" {
+		key = clientKey
+		existing, err := scanMessage(tx.QueryRowContext(ctx,
+			messageSelect+` WHERE m.from_agent_id = ? AND m.client_key = ?`, fromID, clientKey))
+		if err == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, false, err
+		}
+	}
 	var reply any
 	if inReplyTo != 0 {
 		reply = inReplyTo
 	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (workspace_id, thread_id, from_agent_id, to_agent_id, kind, body, in_reply_to, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, workspaceID, threadID, fromID, toID, kind, body, reply, nowMillis())
+		INSERT INTO messages (workspace_id, thread_id, from_agent_id, to_agent_id, kind, body, in_reply_to, created_at, client_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, workspaceID, threadID, fromID, toID, kind, body, reply, nowMillis(), key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if threadID == 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE messages SET thread_id = id WHERE id = ?`, id); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	m, err := scanMessage(tx.QueryRowContext(ctx, messageSelect+` WHERE m.id = ?`, id))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return m, tx.Commit()
+	return m, true, tx.Commit()
 }
 
 // MessageByID finds a message in a workspace.
@@ -373,7 +403,7 @@ func (s *Store) Threads(ctx context.Context, workspaceID, beforeLastID int64, li
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.thread_id, COUNT(*), MAX(m.created_at),
-		       (SELECT r.body FROM messages r WHERE r.id = m.thread_id),
+		       (SELECT r.body FROM messages r WHERE r.workspace_id = m.workspace_id AND r.thread_id = m.thread_id ORDER BY r.id LIMIT 1),
 		       (SELECT GROUP_CONCAT(name, ',') FROM (
 		            SELECT DISTINCT a.name AS name FROM messages x
 		            JOIN agents a ON a.id = x.from_agent_id OR a.id = x.to_agent_id
@@ -402,16 +432,22 @@ func (s *Store) Threads(ctx context.Context, workspaceID, beforeLastID int64, li
 }
 
 // PruneMessages deletes messages older than the cutoff and returns how many went.
+// It works in small batches, so senders are not locked out during a big cleanup.
 func (s *Store) PruneMessages(ctx context.Context, olderThan int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE created_at < ?`, olderThan)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE created_at < ? LIMIT 1000)`, olderThan)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			return total, nil
+		}
 	}
-	return res.RowsAffected()
-}
-
-// PruneSessions deletes expired login sessions.
-func (s *Store) PruneSessions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, nowMillis())
-	return err
 }

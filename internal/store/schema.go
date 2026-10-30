@@ -86,4 +86,8 @@ END;
 CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
 	INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
 END;
+`, `
+-- Lets a client retry a send after a lost response without creating a duplicate.
+ALTER TABLE messages ADD COLUMN client_key TEXT;
+CREATE UNIQUE INDEX messages_client_key ON messages(from_agent_id, client_key) WHERE client_key IS NOT NULL;
 `}

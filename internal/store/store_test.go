@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -220,5 +221,190 @@ func TestWorkspaceIsolation(t *testing.T) {
 	}
 	if _, err := s.AgentByName(ctx, otherWs[0].ID, "frontend"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("agent visible across workspaces: %v", err)
+	}
+}
+
+func TestDamagedDatabaseRefusesToOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broken.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range data {
+		data[i] = 0xAB
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(path + "-wal")
+	os.Remove(path + "-shm")
+	if _, err := Open(path); err == nil {
+		t.Fatal("opened a damaged database without complaint")
+	}
+}
+
+func TestDatabaseWithBadPagesIsDetected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bitrot.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, a, b := fixture(t, s)
+	for i := 0; i < 500; i++ {
+		if _, err := s.InsertMessage(context.Background(), ws, 0, a.ID, b.ID, "note", "some text to fill the pages", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the header intact and scribble over everything after the first pages.
+	for i := 8192; i < len(data); i++ {
+		data[i] = 0xAB
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("did not notice damaged pages")
+	}
+}
+
+func TestBackupIsUsableAndLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "live.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "worth keeping", 0)
+
+	target := filepath.Join(dir, "copy.db")
+	if err := s.Backup(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(target + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temporary file left behind")
+	}
+	restored, err := Open(target)
+	if err != nil {
+		t.Fatalf("backup does not open: %v", err)
+	}
+	defer restored.Close()
+	hits, err := restored.Search(ctx, ws, "keeping", 10)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("backup content: %v %+v", err, hits)
+	}
+}
+
+func TestRetryKeyStoresOnce(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	first, created, err := s.InsertMessageKeyed(ctx, ws, 0, a.ID, b.ID, "ask", "q", 0, "k1")
+	if err != nil || !created {
+		t.Fatalf("first: %v created=%v", err, created)
+	}
+	second, created, err := s.InsertMessageKeyed(ctx, ws, 0, a.ID, b.ID, "ask", "q", 0, "k1")
+	if err != nil || created || second.ID != first.ID {
+		t.Fatalf("retry: %v created=%v id=%d", err, created, second.ID)
+	}
+	// The key belongs to the sender, another agent using the same value is unrelated.
+	_, created, err = s.InsertMessageKeyed(ctx, ws, 0, b.ID, a.ID, "ask", "q", 0, "k1")
+	if err != nil || !created {
+		t.Fatalf("other sender: %v created=%v", err, created)
+	}
+}
+
+func TestPragmasApply(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	expect := map[string]string{"journal_mode": "wal", "auto_vacuum": "2", "synchronous": "2", "foreign_keys": "1"}
+	for pragma, want := range expect {
+		var got string
+		if err := s.db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s = %s, want %s", pragma, got, want)
+		}
+	}
+}
+
+func TestMaintainCleansUp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	owner := a.UserID
+
+	// An expired invite, a used up invite and one that is still good.
+	s.CreateInvite(ctx, ws, owner, "expired", 5, time.Now().Add(-time.Hour).UnixMilli())
+	s.CreateInvite(ctx, ws, owner, "used", 1, time.Now().Add(time.Hour).UnixMilli())
+	s.CreateAccount(ctx, "guest", "h", "used", "")
+	s.CreateInvite(ctx, ws, owner, "good", 5, time.Now().Add(time.Hour).UnixMilli())
+
+	// A revoked agent without history goes, one that history names stays.
+	gone, _ := s.CreateAgent(ctx, ws, owner, "gone", "", "tg")
+	s.RevokeAgent(ctx, ws, gone.ID)
+	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "history", 0)
+	s.RevokeAgent(ctx, ws, a.ID)
+
+	s.CreateSession(ctx, "old", owner, time.Now().Add(-time.Hour).UnixMilli())
+
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var invites, agents, sessions int
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites`).Scan(&invites)
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE id = ?`, gone.ID).Scan(&agents)
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&sessions)
+	if invites != 1 || agents != 0 || sessions != 0 {
+		t.Fatalf("invites=%d revoked agent rows=%d sessions=%d", invites, agents, sessions)
+	}
+	hist, err := s.History(ctx, ws, HistoryFilter{Limit: 10})
+	if err != nil || len(hist) != 1 || hist[0].From != "frontend" {
+		t.Fatalf("history must keep naming a revoked agent: %v %+v", err, hist)
+	}
+}
+
+func TestPruneInBatchesAndReclaimsSpace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	big := make([]byte, 4096)
+	for i := range big {
+		big[i] = 'x'
+	}
+	for i := 0; i < 2500; i++ {
+		if _, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", string(big), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pages := func() (n int) {
+		s.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&n)
+		return n
+	}
+	before := pages()
+	n, err := s.PruneMessages(ctx, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil || n != 2500 {
+		t.Fatalf("pruned %d: %v", n, err)
+	}
+	for i := 0; i < 5; i++ { // one run frees a limited number of pages
+		if err := s.Maintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := pages(); after >= before/2 {
+		t.Fatalf("disk space not given back: %d pages before, %d after", before, after)
 	}
 }
