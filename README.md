@@ -180,6 +180,9 @@ approve each one. That file holds your token in hook mode, make sure it is ignor
 Delivery is at least once. In rare cases a session can see a message twice, it does not
 lose one. With plain HTTP there are no retry keys, so a lost response can mean a duplicate.
 
+Print mode (`claude -p`) cannot be woken up, so such a session reads its messages through
+`check_inbox`.
+
 ## Running it long term
 
 The hub cleans up after itself every hour: expired sessions and invites, leftover agent

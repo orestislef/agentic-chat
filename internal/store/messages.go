@@ -297,11 +297,19 @@ func (s *Store) Undelivered(ctx context.Context, agentID int64, limit int) ([]Me
 	return scanMessages(rows)
 }
 
-// MarkDelivered records that a message was pushed to its recipient.
-func (s *Store) MarkDelivered(ctx context.Context, agentID, messageID int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET delivered_at = COALESCE(delivered_at, ?) WHERE id = ? AND to_agent_id = ?`,
-		nowMillis(), messageID, agentID)
+// MarkDelivered records that messages were handed to their recipient's session.
+func (s *Store) MarkDelivered(ctx context.Context, agentID int64, messageIDs ...int64) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(messageIDs)+2)
+	args = append(args, nowMillis(), agentID)
+	for _, id := range messageIDs {
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE messages SET delivered_at = COALESCE(delivered_at, ?)
+		WHERE to_agent_id = ? AND id IN (?`+strings.Repeat(",?", len(messageIDs)-1)+`)`, args...)
 	return err
 }
 

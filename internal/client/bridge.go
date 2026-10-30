@@ -91,6 +91,10 @@ type Bridge struct {
 
 	seen *seenSet
 
+	// NoPush turns off the push connection, for sessions that get their messages
+	// through the hook commands instead. Both at once would race for each message.
+	NoPush bool
+
 	// Tunable so tests do not have to wait for real timeouts.
 	retryDelays []time.Duration
 	pingEvery   time.Duration
@@ -150,11 +154,13 @@ func (b *Bridge) Run(ctx context.Context) error {
 func (b *Bridge) handle(ctx context.Context, req *mcp.Request, wg *sync.WaitGroup) {
 	switch req.Method {
 	case "initialize":
-		caps := map[string]any{
-			"tools":        map[string]any{},
-			"experimental": map[string]any{"claude/channel": map[string]any{}},
+		caps := map[string]any{"tools": map[string]any{}}
+		instructions := mcp.SharedInstructions + mcp.HookInstructions
+		if !b.NoPush {
+			caps["experimental"] = map[string]any{"claude/channel": map[string]any{}}
+			instructions = mcp.SharedInstructions + mcp.PushInstructions
 		}
-		b.write(mcp.Result(req.ID, mcp.InitializeResult(req.Params, caps, mcp.SharedInstructions+mcp.PushInstructions)))
+		b.write(mcp.Result(req.ID, mcp.InitializeResult(req.Params, caps, instructions)))
 	case "notifications/initialized":
 		b.startPush(ctx, wg)
 	case "notifications/cancelled":
@@ -310,6 +316,9 @@ func (b *Bridge) cancelCall(params json.RawMessage) {
 }
 
 func (b *Bridge) startPush(ctx context.Context, wg *sync.WaitGroup) {
+	if b.NoPush {
+		return
+	}
 	b.pushOnce.Do(func() {
 		wg.Add(1)
 		go func() {

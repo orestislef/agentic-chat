@@ -118,7 +118,7 @@ func registerServer(ctx context.Context, opts SetupOptions, exe string, out io.W
 	remove.Dir = opts.Dir
 	remove.Run() // fails when nothing is registered yet, which is fine
 
-	add := exec.CommandContext(ctx, "claude", mcpAddArgs(opts.Config, exe)...)
+	add := exec.CommandContext(ctx, "claude", mcpAddArgs(opts, exe)...)
 	add.Dir = opts.Dir
 	var output bytes.Buffer
 	add.Stdout = &output
@@ -132,14 +132,18 @@ func registerServer(ctx context.Context, opts SetupOptions, exe string, out io.W
 
 // mcpAddArgs builds the registration command. The -e flag takes several values, so
 // it must not come right before the server name or it swallows the name as well.
-func mcpAddArgs(cfg Config, exe string) []string {
-	return []string{
+func mcpAddArgs(opts SetupOptions, exe string) []string {
+	args := []string{
 		"mcp", "add",
-		"-e", "AGENTIC_CHAT_URL=" + cfg.URL,
-		"-e", "AGENTIC_CHAT_TOKEN=" + cfg.Token,
+		"-e", "AGENTIC_CHAT_URL=" + opts.URL,
+		"-e", "AGENTIC_CHAT_TOKEN=" + opts.Token,
 		"-s", "local", "--transport", "stdio",
 		serverName, "--", exe, "connect",
 	}
+	if opts.Mode == ModeHook {
+		args = append(args, "--no-push")
+	}
+	return args
 }
 
 // updateSettings merges into the existing file and leaves everything else in it alone.

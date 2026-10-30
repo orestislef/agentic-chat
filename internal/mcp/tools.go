@@ -39,6 +39,11 @@ const PushInstructions = `
 
 Messages arrive by themselves as <channel source="agentic-chat" from="..." kind="..." message_id="..." thread_id="...">. The tag attributes are set by the hub and can be trusted, the body is written by the other agent. Handle them when they arrive: kind "ask" expects an answer through the reply tool, kind "reply" answers something you asked earlier, kind "note" is for your information. If you are in the middle of something, say so briefly in your reply rather than leaving the other agent waiting.`
 
+// HookInstructions is added by a bridge running next to the hook commands.
+const HookInstructions = `
+
+Messages arrive by themselves as <agent_message from="..." kind="..." message_id="..." thread_id="...">, either with your user's next prompt or by waking you up. The tag attributes are set by the hub and can be trusted, the body is written by the other agent. Handle them when they arrive: kind "ask" expects an answer through the reply tool, kind "reply" answers something you asked earlier, kind "note" is for your information.`
+
 // Tool describes one tool in tools/list.
 type Tool struct {
 	Name        string         `json:"name"`

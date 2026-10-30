@@ -492,7 +492,13 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func TestServerNameDoesNotFollowEnvFlag(t *testing.T) {
-	args := mcpAddArgs(Config{URL: "https://hub.example", Token: "t"}, "/bin/agentic-chat")
+	args := mcpAddArgs(SetupOptions{Config: Config{URL: "https://hub.example", Token: "t"}, Mode: ModeChannel}, "/bin/agentic-chat")
+	if slices.Contains(args, "--no-push") {
+		t.Fatalf("channel mode needs the push connection: %v", args)
+	}
+	if hook := mcpAddArgs(SetupOptions{Config: Config{URL: "https://hub.example", Token: "t"}, Mode: ModeHook}, "/bin/agentic-chat"); hook[len(hook)-1] != "--no-push" {
+		t.Fatalf("hook mode must not race the watcher: %v", hook)
+	}
 	name := slices.Index(args, serverName)
 	if name < 1 {
 		t.Fatalf("no server name in %v", args)

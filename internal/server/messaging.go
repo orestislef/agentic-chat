@@ -389,7 +389,7 @@ func (s *Server) handleAgentInbox(w http.ResponseWriter, r *http.Request, a *sto
 		Limit:     queryInt(r, "limit", 20, 1, 100),
 		Wait:      time.Duration(queryInt(r, "wait", 0, 0, inboxWaitCap)) * time.Second,
 		Exclusive: r.URL.Query().Get("exclusive") == "1",
-		Peek:      r.URL.Query().Get("peek") == "1",
+		Pending:   r.URL.Query().Get("pending") == "1",
 	})
 	if errors.Is(err, hub.ErrWatcherReplaced) {
 		writeError(w, http.StatusConflict, err.Error())
@@ -402,7 +402,7 @@ func (s *Server) handleAgentInbox(w http.ResponseWriter, r *http.Request, a *sto
 	writeJSON(w, http.StatusOK, map[string]any{"messages": messages})
 }
 
-// handleAgentInboxAck confirms messages fetched with peek=1.
+// handleAgentInboxAck confirms messages fetched with pending=1.
 func (s *Server) handleAgentInboxAck(w http.ResponseWriter, r *http.Request, a *store.Agent) {
 	var in struct {
 		IDs []int64 `json:"ids"`
@@ -414,7 +414,7 @@ func (s *Server) handleAgentInboxAck(w http.ResponseWriter, r *http.Request, a *
 		writeError(w, http.StatusBadRequest, "confirm at most 100 messages at once")
 		return
 	}
-	if err := s.hub.MarkRead(r.Context(), a, in.IDs...); err != nil {
+	if err := s.hub.Ack(r.Context(), a.ID, in.IDs...); err != nil {
 		s.internalError(w, r, err)
 		return
 	}

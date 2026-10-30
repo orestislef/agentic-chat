@@ -315,20 +315,21 @@ paths:
     get:
       summary: Unread messages
       description: >
-        Marks them read unless peek=1, in which case the client confirms through
-        /api/agent/inbox/ack once it has them.
+        Returns unread messages and marks them read. With pending=1 it returns what has
+        not reached the session yet and changes nothing, the client confirms through
+        /api/agent/inbox/ack once it has them. Those stay unread until read for real.
       security: [{ agentToken: [] }]
       parameters:
         - { name: wait, in: query, schema: { type: integer, maximum: 50 }, description: Seconds to wait if empty }
         - { name: exclusive, in: query, schema: { type: string, enum: ["1"] }, description: Replaces earlier exclusive waits of this agent }
-        - { name: peek, in: query, schema: { type: string, enum: ["1"] } }
+        - { name: pending, in: query, schema: { type: string, enum: ["1"] } }
         - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
       responses:
         "200": { description: Messages }
         "409": { description: Replaced by a newer exclusive wait, or access was revoked }
   /api/agent/inbox/ack:
     post:
-      summary: Confirm messages fetched with peek=1
+      summary: Confirm messages fetched with pending=1
       security: [{ agentToken: [] }]
       requestBody:
         required: true

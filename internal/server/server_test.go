@@ -494,7 +494,7 @@ func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
 	var sent store.Message
 	alice.mustJSON(http.MethodPost, "/api/workspaces/"+aliceWs+"/messages", map[string]string{"to": "secretbot", "body": "private plans"}, http.StatusCreated, &sent)
 
-	// Bob's agent tries to confirm Alice's message as read.
+	// Bob's agent tries to confirm Alice's message as delivered.
 	body, _ := json.Marshal(map[string]any{"ids": []int64{sent.ID}})
 	req, _ := http.NewRequest(http.MethodPost, ts.url+"/api/agent/inbox/ack", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+bobToken)
@@ -507,7 +507,7 @@ func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
 
 	// The real recipient still has it unread, and only the recipient sees it.
 	inbox := func(token string) string {
-		req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/inbox?peek=1", nil)
+		req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/inbox?pending=1", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -518,7 +518,7 @@ func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
 		return string(data)
 	}
 	if !strings.Contains(inbox(aliceToken), "private plans") {
-		t.Fatal("another agent was able to mark the message read")
+		t.Fatal("another agent was able to mark the message delivered")
 	}
 	if strings.Contains(inbox(bobToken), "private plans") {
 		t.Fatal("message leaked to another workspace")

@@ -112,13 +112,16 @@ func clientFlags(fs *flag.FlagSet) *client.Config {
 func runConnect(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	cfg := clientFlags(fs)
+	noPush := fs.Bool("no-push", false, "do not push messages into the session, the hook commands deliver them")
 	fs.Parse(args)
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	// Stdout belongs to the protocol, logs can only go to stderr.
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	return client.NewBridge(*cfg, os.Stdin, os.Stdout, log).Run(ctx)
+	bridge := client.NewBridge(*cfg, os.Stdin, os.Stdout, log)
+	bridge.NoPush = *noPush
+	return bridge.Run(ctx)
 }
 
 func runHook(ctx context.Context, args []string) (int, error) {

@@ -391,22 +391,27 @@ func TestRetriedSendIsStoredOnce(t *testing.T) {
 	}
 }
 
-func TestPeekLeavesMessagesUnread(t *testing.T) {
+func TestPendingStaysUntilAckedAndUnreadAfterwards(t *testing.T) {
 	e := setup(t, DefaultLimits())
 	ctx := context.Background()
 	m, _ := e.hub.Send(ctx, e.frontend, "backend", "note", "keep me", 0)
 	for i := 0; i < 2; i++ {
-		got, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Peek: true})
+		got, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Pending: true})
 		if err != nil || len(got) != 1 {
-			t.Fatalf("peek %d: %v %+v", i, err, got)
+			t.Fatalf("pending %d: %v %+v", i, err, got)
 		}
 	}
-	if err := e.hub.MarkRead(ctx, e.backend, m.ID); err != nil {
+	if err := e.hub.Ack(ctx, e.backend.ID, m.ID); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Peek: true})
+	got, _ := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Pending: true})
 	if len(got) != 0 {
-		t.Fatalf("still unread after confirming: %+v", got)
+		t.Fatalf("still pending after the ack: %+v", got)
+	}
+	// Delivered is not read: the session may never have seen it, so the inbox keeps it.
+	got, _ = e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10})
+	if len(got) != 1 || got[0].DeliveredAt == 0 {
+		t.Fatalf("inbox lost a delivered message: %+v", got)
 	}
 }
 

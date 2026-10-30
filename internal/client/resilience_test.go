@@ -479,7 +479,7 @@ func TestRevokedTokenStopsReconnecting(t *testing.T) {
 	}
 }
 
-func TestWatchKeepsMessageUntilItHasIt(t *testing.T) {
+func TestWatchKeepsMessageUntilItHasItAndInboxStillFindsIt(t *testing.T) {
 	w := newWorld(t)
 	var dropped atomic.Bool
 	real := w.handler()
@@ -512,9 +512,72 @@ func TestWatchKeepsMessageUntilItHasIt(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("watcher never delivered")
 	}
-	unread, _ := w.store.Unread(context.Background(), w.backendID, 10)
-	if len(unread) != 0 {
-		t.Fatalf("confirmed message still unread: %+v", unread)
+	pending, _ := w.store.Undelivered(context.Background(), w.backendID, 10)
+	if len(pending) != 0 {
+		t.Fatalf("confirmed message still pending: %+v", pending)
+	}
+	// This is the bug a real session hit: the watcher must not empty the inbox, or a
+	// session that calls check_inbox finds nothing and the question goes unanswered.
+	back := fastSession(t, srv.URL, w.back)
+	back.initialize()
+	if text := toolText(back.tool(5, "check_inbox", nil)); !strings.Contains(text, "survives the drop") {
+		t.Fatalf("inbox lost the message: %s", text)
+	}
+}
+
+func TestPrintModeWatcherExitsAtOnce(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
+	done := make(chan int, 1)
+	go func() {
+		done <- RunWatch(context.Background(), Config{URL: "http://127.0.0.1:1", Token: "x"}, io.Discard)
+	}()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a watcher in print mode keeps the whole process from exiting")
+	}
+}
+
+func TestNoPushBridgeDeclaresNoChannelAndStaysQuiet(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	lines := make(chan map[string]any, 16)
+	bridge := NewBridge(Config{URL: srv.URL, Token: w.back}, inR, outW, quietLog())
+	bridge.NoPush = true
+	bridge.pushDelay = 0
+	go bridge.Run(context.Background())
+	go readLines(t, outR, lines)
+	defer inW.Close()
+
+	io.WriteString(inW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n")
+	io.WriteString(inW, `{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n")
+	result := (<-lines)["result"].(map[string]any)
+	if _, ok := result["capabilities"].(map[string]any)["experimental"]; ok {
+		t.Fatal("declared a channel without a push connection")
+	}
+	if !strings.Contains(result["instructions"].(string), "agent_message") {
+		t.Fatal("instructions describe the wrong delivery path")
+	}
+
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "for the watcher"})
+	select {
+	case m := <-lines:
+		t.Fatalf("pushed anyway: %v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Still undelivered, so the watcher gets it.
+	pending, _ := w.store.Undelivered(context.Background(), w.backendID, 10)
+	if len(pending) != 1 {
+		t.Fatalf("pending: %+v", pending)
 	}
 }
 

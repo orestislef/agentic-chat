@@ -432,9 +432,11 @@ func (h *Hub) Kick(workspaceID, agentID int64) {
 	h.publishPresenceLocked(workspaceID, agentID, StateOffline)
 }
 
-// Ack records that the client received a pushed message.
-func (h *Hub) Ack(ctx context.Context, agentID, messageID int64) error {
-	return h.store.MarkDelivered(ctx, agentID, messageID)
+// Ack records that messages reached the client. They stay unread, because reaching
+// the client does not prove the session saw them: Claude Code drops pushes silently
+// when a session was not started with channels enabled. check_inbox still lists them.
+func (h *Hub) Ack(ctx context.Context, agentID int64, messageIDs ...int64) error {
+	return h.store.MarkDelivered(ctx, agentID, messageIDs...)
 }
 
 // Subscribe registers a web UI connection for a workspace.
@@ -535,18 +537,14 @@ type InboxOptions struct {
 	// Exclusive replaces any earlier exclusive wait of the same agent, which keeps
 	// stale background watchers from swallowing messages.
 	Exclusive bool
-	// Peek leaves the messages unread. The caller confirms with MarkRead once it
-	// has them, so a response lost on the way does not lose the messages.
-	Peek bool
+	// Pending returns what has not been handed to the session yet and changes nothing.
+	// It is the push path for clients that poll: they confirm with Ack once they have
+	// the messages, so a response lost on the way loses nothing.
+	Pending bool
 }
 
-// MarkRead confirms messages an earlier Peek returned.
-func (h *Hub) MarkRead(ctx context.Context, a *store.Agent, ids ...int64) error {
-	return h.store.MarkRead(ctx, a.ID, ids...)
-}
-
-// Inbox returns unread messages, by default marking them read. With a wait it
-// blocks until at least one arrives.
+// Inbox returns unread messages and marks them read, or with Pending what is still
+// undelivered. With a wait it blocks until at least one arrives.
 func (h *Hub) Inbox(ctx context.Context, a *store.Agent, opts InboxOptions) ([]store.Message, error) {
 	limit, wait, exclusive := opts.Limit, opts.Wait, opts.Exclusive
 	w := &inboxWaiter{wake: make(chan struct{}, 1), cancel: make(chan struct{}), exclusive: exclusive}
@@ -583,11 +581,17 @@ func (h *Hub) Inbox(ctx context.Context, a *store.Agent, opts InboxOptions) ([]s
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for {
-		messages, err := h.store.Unread(ctx, a.ID, limit)
+		var messages []store.Message
+		var err error
+		if opts.Pending {
+			messages, err = h.store.Undelivered(ctx, a.ID, limit)
+		} else {
+			messages, err = h.store.Unread(ctx, a.ID, limit)
+		}
 		if err != nil {
 			return nil, err
 		}
-		if len(messages) > 0 && opts.Peek {
+		if len(messages) > 0 && opts.Pending {
 			return messages, nil
 		}
 		if len(messages) > 0 {

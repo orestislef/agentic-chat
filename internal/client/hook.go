@@ -30,7 +30,7 @@ type inboxMessage struct {
 var errWatcherReplaced = errors.New("watcher replaced")
 
 func fetchInbox(ctx context.Context, cfg Config, wait int, exclusive bool) ([]inboxMessage, error) {
-	url := fmt.Sprintf("%s/api/agent/inbox?peek=1&wait=%d", cfg.URL, wait)
+	url := fmt.Sprintf("%s/api/agent/inbox?pending=1&wait=%d", cfg.URL, wait)
 	if exclusive {
 		url += "&exclusive=1"
 	}
@@ -60,8 +60,9 @@ func fetchInbox(ctx context.Context, cfg Config, wait int, exclusive bool) ([]in
 	return out.Messages, nil
 }
 
-// confirmInbox marks messages read once this process has them in hand. If it fails
-// the session may see them again later, which beats never seeing them at all.
+// confirmInbox marks messages delivered once this process has them in hand. They stay
+// unread, so check_inbox still finds them if the session never got to see them. If this
+// fails they get delivered again later, which beats not at all.
 func confirmInbox(ctx context.Context, cfg Config, messages []inboxMessage) error {
 	ids := make([]int64, len(messages))
 	for i, m := range messages {
@@ -151,6 +152,11 @@ func RunHook(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io
 // code that wakes an idle session. The session starts a new watcher when its turn
 // ends, and the hub replaces the older one, so one is always listening.
 func RunWatch(ctx context.Context, cfg Config, stderr io.Writer) int {
+	// In print mode there is nobody to wake, and a hook still running keeps the process
+	// from exiting. Such a session reads its messages through check_inbox instead.
+	if os.Getenv("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli" {
+		return 0
+	}
 	// A session that died leaves its hook behind. On Unix the parent id changes
 	// when that happens, and a watcher nobody listens to must not take messages.
 	parent := os.Getppid()
