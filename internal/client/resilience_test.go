@@ -685,14 +685,15 @@ func TestAskerIsToldWhenTheOtherAgentIsRemoved(t *testing.T) {
 	if err := w.removeBackendThroughAPI(srv.URL); err != nil {
 		t.Fatal(err)
 	}
+	// Read this first, the tool helper below skips pushes while it waits for its answer.
+	notice := front.nextPush(5 * time.Second)
+	if notice["meta"].(map[string]any)["kind"] != "system" || !strings.Contains(notice["content"].(string), "backend was removed") {
+		t.Fatalf("notice: %v", notice)
+	}
 	var got map[string]any
 	json.Unmarshal([]byte(toolText(front.tool(3, "wait_for_reply", map[string]any{"message_id": asked["message_id"], "wait_seconds": 5}))), &got)
 	if got["status"] != "unreachable" {
 		t.Fatalf("got %v", got)
-	}
-	notice := front.nextPush(5 * time.Second)
-	if notice["meta"].(map[string]any)["kind"] != "system" || !strings.Contains(notice["content"].(string), "backend was removed") {
-		t.Fatalf("notice: %v", notice)
 	}
 }
 
