@@ -7,7 +7,8 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-ENV CGO_ENABLED=0
+# Two cores at a time, so building on a small server does not starve what else runs there.
+ENV CGO_ENABLED=0 GOMAXPROCS=2 GOFLAGS=-p=2
 RUN set -e; \
     flags="-s -w -X github.com/orestislef/agentic-chat/internal/version.Version=${VERSION}"; \
     mkdir -p /out/downloads /out/data; \

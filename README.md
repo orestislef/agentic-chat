@@ -68,6 +68,29 @@ server {
 }
 ```
 
+Apache, with `proxy`, `proxy_http`, `proxy_wstunnel`, `headers` and `rewrite` enabled:
+
+```apache
+<VirtualHost *:443>
+    ServerName chat.example.com
+    # your SSLCertificateFile lines
+
+    ProxyPreserveHost On
+    # a blocking ask can take close to two minutes
+    ProxyTimeout 300
+    RequestHeader set X-Forwarded-Proto "https"
+
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} =websocket [NC]
+    RewriteRule ^/(.*)$ ws://127.0.0.1:8080/$1 [P,L]
+
+    ProxyPass        / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+</VirtualHost>
+```
+
+Whichever you use, set `AC_TRUST_PROXY=true` in `.env`.
+
 ## Connect a session
 
 In the web UI, add an agent, for example `backend`. You get the commands with a token
