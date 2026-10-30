@@ -37,14 +37,14 @@ func (s *Store) CountDemoWorkspaces(ctx context.Context, userID int64) (int, err
 // PruneDemo deletes demo workspaces older than the cutoff with everything in them,
 // then demo accounts left with nothing. Rows without the demo mark are never touched.
 func (s *Store) PruneDemo(ctx context.Context, olderThan int64) (workspaces, users int64, err error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM workspaces WHERE demo = 1 AND created_at < ?`, olderThan)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM workspaces WHERE demo = 1 AND created_at < ?`, olderThan)
 	if err != nil {
 		return 0, 0, err
 	}
 	if workspaces, err = res.RowsAffected(); err != nil {
 		return 0, 0, err
 	}
-	res, err = s.db.ExecContext(ctx, `
+	res, err = s.w.ExecContext(ctx, `
 		DELETE FROM users WHERE demo = 1 AND created_at < ?
 		AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id = users.id)
 		AND NOT EXISTS (SELECT 1 FROM agents WHERE user_id = users.id)`, olderThan)

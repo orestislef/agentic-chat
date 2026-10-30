@@ -254,3 +254,25 @@ func TestWaitingOnARemovedAgentSaysSo(t *testing.T) {
 		t.Fatalf("asking a removed agent: %q %v", text, isErr)
 	}
 }
+
+func TestDatabaseFailureIsNotReportedAsBadToken(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "gone.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHandler(s, hub.New(s, hub.DefaultLimits(), log), log))
+	defer srv.Close()
+	s.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	req.Header.Set("Authorization", "Bearer ac_perfectly_fine")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d: a client treats 401 as revoked and gives up for good", resp.StatusCode)
+	}
+}

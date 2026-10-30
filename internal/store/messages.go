@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -60,7 +63,7 @@ func scanAgent(row interface{ Scan(...any) error }) (*Agent, error) {
 // CreateAgent adds a coding agent to a workspace.
 func (s *Store) CreateAgent(ctx context.Context, workspaceID, userID int64, name, description, tokenHash string) (*Agent, error) {
 	now := nowMillis()
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.w.ExecContext(ctx, `
 		INSERT INTO agents (workspace_id, user_id, name, description, kind, token_hash, created_at)
 		VALUES (?, ?, ?, ?, 'agent', ?, ?)`, workspaceID, userID, name, description, tokenHash, now)
 	if err != nil {
@@ -122,7 +125,7 @@ func (s *Store) Agents(ctx context.Context, workspaceID int64) ([]Agent, error) 
 
 // RevokeAgent disables an agent and frees its name. Its history stays readable.
 func (s *Store) RevokeAgent(ctx context.Context, workspaceID, agentID int64) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.w.ExecContext(ctx, `
 		UPDATE agents SET revoked_at = ?, token_hash = NULL
 		WHERE id = ? AND workspace_id = ? AND kind = 'agent' AND revoked_at IS NULL`, nowMillis(), agentID, workspaceID)
 	if err != nil {
@@ -136,7 +139,7 @@ func (s *Store) RevokeAgent(ctx context.Context, workspaceID, agentID int64) err
 
 // RotateAgentToken replaces the token of an agent.
 func (s *Store) RotateAgentToken(ctx context.Context, workspaceID, agentID int64, tokenHash string) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.w.ExecContext(ctx, `
 		UPDATE agents SET token_hash = ?
 		WHERE id = ? AND workspace_id = ? AND kind = 'agent' AND revoked_at IS NULL`, tokenHash, agentID, workspaceID)
 	if err != nil {
@@ -152,10 +155,12 @@ func (s *Store) RotateAgentToken(ctx context.Context, workspaceID, agentID int64
 // value is a few seconds stale, a disk sync on every tool call would be wasted.
 func (s *Store) TouchAgent(ctx context.Context, agentID int64) error {
 	now := nowMillis()
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE agents SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)`,
-		now, agentID, now-10_000)
-	return err
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(),
+			`UPDATE agents SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)`,
+			now, agentID, now-10_000)
+		return err
+	})
 }
 
 const messageSelect = `
@@ -207,60 +212,57 @@ func (s *Store) MessageByClientKey(ctx context.Context, fromID int64, clientKey 
 // InsertMessageKeyed stores a message unless the sender already stored one under
 // clientKey, in which case it returns that one and false.
 func (s *Store) InsertMessageKeyed(ctx context.Context, workspaceID, threadID, fromID, toID int64, kind, body string, inReplyTo int64, clientKey string) (*Message, bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	defer tx.Rollback()
-	var key any
-	if clientKey != "" {
-		key = clientKey
-		existing, err := scanMessage(tx.QueryRowContext(ctx,
-			messageSelect+` WHERE m.from_agent_id = ? AND m.client_key = ?`, fromID, clientKey))
-		if err == nil {
-			return existing, false, nil
+	var m *Message
+	created := false
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		ctx := context.Background()
+		var key any
+		if clientKey != "" {
+			key = clientKey
+			existing, err := scanMessage(tx.QueryRowContext(ctx,
+				messageSelect+` WHERE m.from_agent_id = ? AND m.client_key = ?`, fromID, clientKey))
+			if err == nil {
+				m = existing
+				return nil
+			}
+			if !errors.Is(err, ErrNotFound) {
+				return err
+			}
 		}
-		if !errors.Is(err, ErrNotFound) {
-			return nil, false, err
+		var reply any
+		if inReplyTo != 0 {
+			reply = inReplyTo
 		}
-	}
-	var reply any
-	if inReplyTo != 0 {
-		reply = inReplyTo
-	}
-	res, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (workspace_id, thread_id, from_agent_id, to_agent_id, kind, body, in_reply_to, created_at, client_key)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, workspaceID, threadID, fromID, toID, kind, body, reply, nowMillis(), key)
-	if err != nil {
-		return nil, false, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, false, err
-	}
-	if threadID == 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET thread_id = id WHERE id = ?`, id); err != nil {
-			return nil, false, err
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO messages (workspace_id, thread_id, from_agent_id, to_agent_id, kind, body, in_reply_to, created_at, client_key)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, workspaceID, threadID, fromID, toID, kind, body, reply, nowMillis(), key)
+		if err != nil {
+			return err
 		}
-	}
-	m, err := scanMessage(tx.QueryRowContext(ctx, messageSelect+` WHERE m.id = ?`, id))
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if threadID == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET thread_id = id WHERE id = ?`, id); err != nil {
+				return err
+			}
+		}
+		if m, err = scanMessage(tx.QueryRowContext(ctx, messageSelect+` WHERE m.id = ?`, id)); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
 	if err != nil {
 		return nil, false, err
 	}
-	return m, true, tx.Commit()
+	return m, created, nil
 }
 
 // MessageByID finds a message in a workspace.
 func (s *Store) MessageByID(ctx context.Context, workspaceID, id int64) (*Message, error) {
 	return scanMessage(s.db.QueryRowContext(ctx, messageSelect+` WHERE m.id = ? AND m.workspace_id = ?`, id, workspaceID))
-}
-
-// ThreadExists reports whether a thread with that id exists in the workspace.
-func (s *Store) ThreadExists(ctx context.Context, workspaceID, threadID int64) (bool, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE workspace_id = ? AND thread_id = ? LIMIT 1`, workspaceID, threadID).Scan(&n)
-	return n > 0, err
 }
 
 // ThreadLength counts the messages in a thread.
@@ -307,10 +309,12 @@ func (s *Store) MarkDelivered(ctx context.Context, agentID int64, messageIDs ...
 	for _, id := range messageIDs {
 		args = append(args, id)
 	}
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE messages SET delivered_at = COALESCE(delivered_at, ?)
-		WHERE to_agent_id = ? AND id IN (?`+strings.Repeat(",?", len(messageIDs)-1)+`)`, args...)
-	return err
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(), `
+			UPDATE messages SET delivered_at = COALESCE(delivered_at, ?)
+			WHERE to_agent_id = ? AND id IN (?`+strings.Repeat(",?", len(messageIDs)-1)+`)`, args...)
+		return err
+	})
 }
 
 // MarkRead records that the recipient has seen the messages.
@@ -324,10 +328,12 @@ func (s *Store) MarkRead(ctx context.Context, agentID int64, messageIDs ...int64
 	for _, id := range messageIDs {
 		args = append(args, id)
 	}
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE messages SET read_at = COALESCE(read_at, ?), delivered_at = COALESCE(delivered_at, ?)
-		WHERE to_agent_id = ? AND id IN (?`+strings.Repeat(",?", len(messageIDs)-1)+`)`, args...)
-	return err
+	return s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(), `
+			UPDATE messages SET read_at = COALESCE(read_at, ?), delivered_at = COALESCE(delivered_at, ?)
+			WHERE to_agent_id = ? AND id IN (?`+strings.Repeat(",?", len(messageIDs)-1)+`)`, args...)
+		return err
+	})
 }
 
 // HistoryFilter narrows a history query. Zero values mean no restriction.
@@ -382,15 +388,24 @@ func (s *Store) Search(ctx context.Context, workspaceID int64, query string, lim
 	if match == "" {
 		return []Message{}, nil
 	}
+	// Ranking needs every candidate, so a common word would mean ranking the whole history.
+	// Only the newest matches get ranked, which keeps the cost flat as history grows.
 	rows, err := s.db.QueryContext(ctx, messageSelect+`
-		JOIN messages_fts ON messages_fts.rowid = m.id
-		WHERE messages_fts MATCH ? AND m.workspace_id = ?
-		ORDER BY messages_fts.rank LIMIT ?`, match, workspaceID, limit)
+		JOIN (
+			SELECT f.rowid AS hit, f.rank AS score
+			FROM messages_fts f CROSS JOIN messages x ON x.id = f.rowid
+			WHERE messages_fts MATCH ? AND x.workspace_id = ?
+			ORDER BY f.rowid DESC LIMIT `+strconv.Itoa(searchCandidates)+`
+		) h ON h.hit = m.id
+		ORDER BY h.score LIMIT ?`, match, workspaceID, limit)
 	if err != nil {
 		return nil, err
 	}
 	return scanMessages(rows)
 }
+
+// searchCandidates is how many of the newest matches get ranked.
+const searchCandidates = 2000
 
 func ftsQuery(query string) string {
 	terms := strings.Fields(query)
@@ -400,43 +415,104 @@ func ftsQuery(query string) string {
 	return strings.Join(terms, " ")
 }
 
-// Threads lists conversations in a workspace, most recently active first.
-func (s *Store) Threads(ctx context.Context, workspaceID, beforeLastID int64, limit int) ([]Thread, error) {
-	having := ""
-	args := []any{workspaceID}
-	if beforeLastID != 0 {
-		having = `HAVING MAX(m.id) < ?`
-		args = append(args, beforeLastID)
+// Threads lists conversations in a workspace, most recently active first. It walks back
+// from the newest message until it has seen enough threads, so its cost depends on how many
+// are asked for and not on how long the history is.
+func (s *Store) Threads(ctx context.Context, workspaceID int64, limit int) ([]Thread, error) {
+	const page = 500
+	ids := make([]int64, 0, limit)
+	cursor := int64(math.MaxInt64)
+	for len(ids) < limit {
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id, thread_id FROM messages WHERE workspace_id = ? AND id < ? ORDER BY id DESC LIMIT ?`,
+			workspaceID, cursor, page)
+		if err != nil {
+			return nil, err
+		}
+		n := 0
+		for rows.Next() {
+			var thread int64
+			if err := rows.Scan(&cursor, &thread); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			n++
+			if len(ids) < limit && !slices.Contains(ids, thread) {
+				ids = append(ids, thread)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if n < page {
+			break
+		}
 	}
-	args = append(args, limit)
+	if len(ids) == 0 {
+		return []Thread{}, nil
+	}
+
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, workspaceID)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	in := `(?` + strings.Repeat(",?", len(ids)-1) + `)`
+
+	byID := make(map[int64]*Thread, len(ids))
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.thread_id, COUNT(*), MAX(m.created_at),
-		       (SELECT r.body FROM messages r WHERE r.workspace_id = m.workspace_id AND r.thread_id = m.thread_id ORDER BY r.id LIMIT 1),
-		       (SELECT GROUP_CONCAT(name, ',') FROM (
-		            SELECT DISTINCT a.name AS name FROM messages x
-		            JOIN agents a ON a.id = x.from_agent_id OR a.id = x.to_agent_id
-		            WHERE x.thread_id = m.thread_id AND x.workspace_id = m.workspace_id))
-		FROM messages m WHERE m.workspace_id = ?
-		GROUP BY m.thread_id `+having+` ORDER BY MAX(m.id) DESC LIMIT ?`, args...)
+		       (SELECT substr(r.body, 1, 200) FROM messages r
+		        WHERE r.workspace_id = m.workspace_id AND r.thread_id = m.thread_id ORDER BY r.id LIMIT 1)
+		FROM messages m WHERE m.workspace_id = ? AND m.thread_id IN `+in+` GROUP BY m.thread_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		t := Thread{Participants: []string{}}
+		if err := rows.Scan(&t.ID, &t.Messages, &t.LastAt, &t.Preview); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		byID[t.ID] = &t
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `
+		SELECT DISTINCT m.thread_id, a.name FROM messages m
+		JOIN agents a ON a.id = m.from_agent_id OR a.id = m.to_agent_id
+		WHERE m.workspace_id = ? AND m.thread_id IN `+in, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []Thread{}
 	for rows.Next() {
-		var t Thread
-		var preview, names sql.NullString
-		if err := rows.Scan(&t.ID, &t.Messages, &t.LastAt, &preview, &names); err != nil {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
 			return nil, err
 		}
-		t.Preview = preview.String
-		if len(t.Preview) > 200 {
-			t.Preview = strings.ToValidUTF8(t.Preview[:200], "")
+		if t := byID[id]; t != nil {
+			t.Participants = append(t.Participants, name)
 		}
-		t.Participants = strings.Split(names.String, ",")
-		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]Thread, 0, len(ids))
+	for _, id := range ids {
+		if t := byID[id]; t != nil {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
 }
 
 // PruneMessages deletes messages older than the cutoff and returns how many went.
@@ -444,7 +520,7 @@ func (s *Store) Threads(ctx context.Context, workspaceID, beforeLastID int64, li
 func (s *Store) PruneMessages(ctx context.Context, olderThan int64) (int64, error) {
 	var total int64
 	for {
-		res, err := s.db.ExecContext(ctx,
+		res, err := s.w.ExecContext(ctx,
 			`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE created_at < ? LIMIT 1000)`, olderThan)
 		if err != nil {
 			return total, err

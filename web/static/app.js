@@ -11,6 +11,7 @@ const state = {
   workspaceId: null,
   agents: [],
   threads: [],
+  threadLimit: 50,
   threadId: null,
   messages: [],
   search: "",
@@ -229,6 +230,7 @@ async function openWorkspace(id) {
   state.workspaceId = id;
   localStorage.setItem("workspace", String(id));
   state.threadId = null;
+  state.threadLimit = 50;
   state.messages = [];
   state.search = "";
   await reloadWorkspace();
@@ -239,7 +241,7 @@ async function reloadWorkspace() {
   const id = state.workspaceId;
   const [agents, threads] = await Promise.all([
     api("GET", `/api/workspaces/${id}/agents`),
-    api("GET", `/api/workspaces/${id}/threads`),
+    api("GET", `/api/workspaces/${id}/threads?limit=${state.threadLimit}`),
   ]);
   if (id !== state.workspaceId) return;
   state.agents = agents;
@@ -315,8 +317,16 @@ async function drawThreadList() {
       : [h("p", { class: "empty" }, "No messages match that search.")]));
     return;
   }
+  const more = state.threads.length >= state.threadLimit && state.threadLimit < 1000 && h("button", {
+    class: "btn plain more-threads",
+    onclick: async () => {
+      state.threadLimit = Math.min(1000, state.threadLimit * 2);
+      state.threads = await api("GET", `/api/workspaces/${state.workspaceId}/threads?limit=${state.threadLimit}`);
+      drawThreadList();
+    },
+  }, "Show older conversations");
   refs.threadList.replaceChildren(...(state.threads.length
-    ? state.threads.map((t) => threadButton(t.id, t.participants.join(", "), t.last_at, t.preview))
+    ? [...state.threads.map((t) => threadButton(t.id, t.participants.join(", "), t.last_at, t.preview)), ...(more ? [more] : [])]
     : [h("p", { class: "empty" }, "Conversations between your agents show up here.")]));
 }
 
@@ -601,7 +611,7 @@ function refreshHeads() {
 }
 
 const scheduleThreadReload = debounce(async () => {
-  state.threads = await api("GET", `/api/workspaces/${state.workspaceId}/threads`);
+  state.threads = await api("GET", `/api/workspaces/${state.workspaceId}/threads?limit=${state.threadLimit}`);
   drawThreadList();
 }, 200);
 

@@ -144,8 +144,7 @@ func (s *Server) handleRotateAgent(w http.ResponseWriter, r *http.Request, c *me
 }
 
 func (s *Server) handleListThreads(w http.ResponseWriter, r *http.Request, c *memberContext) {
-	before := int64(queryInt(r, "before", 0, 0, int(^uint32(0)>>1)))
-	threads, err := s.store.Threads(r.Context(), c.WorkspaceID, before, queryInt(r, "limit", 50, 1, 200))
+	threads, err := s.store.Threads(r.Context(), c.WorkspaceID, queryInt(r, "limit", 50, 1, 1000))
 	if err != nil {
 		s.internalError(w, r, err)
 		return

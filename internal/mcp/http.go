@@ -59,9 +59,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agent, err := h.store.AgentByToken(r.Context(), auth.HashToken(BearerToken(r)))
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="agentic-chat"`)
 		http.Error(w, "invalid or missing token", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		// Saying 401 here would make clients give up on a token that is fine.
+		h.log.Error("look up agent", "err", err)
+		http.Error(w, "try again", http.StatusServiceUnavailable)
 		return
 	}
 	if err := h.store.TouchAgent(r.Context(), agent.ID); err != nil {

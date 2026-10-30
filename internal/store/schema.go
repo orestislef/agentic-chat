@@ -95,4 +95,11 @@ CREATE UNIQUE INDEX messages_client_key ON messages(from_agent_id, client_key) W
 -- deleted by it, so turning it on cannot touch anything that existed before.
 ALTER TABLE users ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE workspaces ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
+`, `
+-- Newest first within a workspace, for history and the list of conversations.
+CREATE INDEX messages_workspace ON messages(workspace_id, id);
+-- Only what is still open needs indexing, read messages are the vast majority and stay out.
+DROP INDEX messages_inbox;
+CREATE INDEX messages_unread ON messages(to_agent_id, id) WHERE read_at IS NULL;
+CREATE INDEX messages_undelivered ON messages(to_agent_id, id) WHERE delivered_at IS NULL AND read_at IS NULL;
 `}

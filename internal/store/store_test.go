@@ -133,7 +133,7 @@ func TestThreadsAndInbox(t *testing.T) {
 		t.Fatalf("reply lookup: %v %+v", err, got)
 	}
 
-	threads, err := s.Threads(ctx, ws, 0, 10)
+	threads, err := s.Threads(ctx, ws, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,5 +466,122 @@ func TestDemoPruneOnlyTouchesDemoRows(t *testing.T) {
 	}
 	if err := s.Maintain(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestThreadsNewestFirstAcrossPages(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	first, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "ask", "the oldest thread", 0)
+	// Enough newer messages in one thread to push the first thread past a whole page.
+	second, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "ask", "the busy thread", 0)
+	for i := 0; i < 600; i++ {
+		if _, err := s.InsertMessage(ctx, ws, second.ThreadID, b.ID, a.ID, "note", "more", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	threads, err := s.Threads(ctx, ws, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads) != 2 || threads[0].ID != second.ThreadID || threads[1].ID != first.ThreadID {
+		t.Fatalf("threads: %+v", threads)
+	}
+	if threads[0].Messages != 601 || threads[0].Preview != "the busy thread" || len(threads[0].Participants) != 2 {
+		t.Fatalf("summary: %+v", threads[0])
+	}
+	// Moving an old thread back to the top.
+	s.InsertMessage(ctx, ws, first.ThreadID, b.ID, a.ID, "reply", "back again", first.ID)
+	threads, _ = s.Threads(ctx, ws, 1)
+	if len(threads) != 1 || threads[0].ID != first.ThreadID {
+		t.Fatalf("limit and order: %+v", threads)
+	}
+	empty, _ := s.Threads(ctx, ws+999, 10)
+	if len(empty) != 0 {
+		t.Fatalf("other workspace: %+v", empty)
+	}
+}
+
+func TestSearchFindsBestAmongRecentAndStaysInWorkspace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "cache", 0)
+	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "a long message that mentions cache once among a lot of other unrelated words here", 0)
+	hits, err := s.Search(ctx, ws, "cache", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 || hits[0].Body != "cache" {
+		t.Fatalf("best match should come first: %+v", hits)
+	}
+}
+
+func TestConcurrentWritesAllLandAndFailuresStayAlone(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	const n = 400
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			// Every tenth one breaks a foreign key, which must not take its batch down with it.
+			to := b.ID
+			if i%10 == 0 {
+				to = 999999
+			}
+			_, err := s.InsertMessage(ctx, ws, 0, a.ID, to, "note", "x", 0)
+			if i%10 == 0 && err == nil {
+				err = errors.New("broken insert was accepted")
+			} else if i%10 == 0 {
+				err = nil
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stored int
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&stored)
+	if stored != n-n/10 {
+		t.Fatalf("stored %d of %d", stored, n-n/10)
+	}
+}
+
+func TestCancelledWriterDoesNotBreakOthers(t *testing.T) {
+	s := newTestStore(t)
+	ws, a, b := fixture(t, s)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.InsertMessage(cancelled, ws, 0, a.ID, b.ID, "note", "maybe", 0)
+	if _, err := s.InsertMessage(context.Background(), ws, 0, a.ID, b.ID, "note", "for sure", 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteAfterCloseFailsCleanly(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ws, a, b := fixture(t, s)
+	s.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "late", 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("write after close reported success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("write after close hangs")
 	}
 }

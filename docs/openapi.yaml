@@ -256,8 +256,7 @@ paths:
       summary: Conversations, most recently active first
       security: [{ session: [] }]
       parameters:
-        - { name: before, in: query, schema: { type: integer }, description: "Only threads whose last message id is below this" }
-        - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000 } }
       responses:
         "200": { description: List }
   /api/workspaces/{id}/messages:

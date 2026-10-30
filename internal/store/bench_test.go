@@ -34,7 +34,7 @@ func seedHistory(b *testing.B, messages int) *seeded {
 	a, _ := s.CreateAgent(ctx, ws, u.ID, "frontend", "", "ta")
 	c, _ := s.CreateAgent(ctx, ws, u.ID, "backend", "", "tb")
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func BenchmarkQueries(b *testing.B) {
 		name string
 		run  func() error
 	}{
-		{"Threads", func() error { _, err := d.store.Threads(ctx, d.workspaceID, 0, 50); return err }},
+		{"Threads", func() error { _, err := d.store.Threads(ctx, d.workspaceID, 50); return err }},
 		{"HistoryThread", func() error {
 			_, err := d.store.History(ctx, d.workspaceID, HistoryFilter{ThreadID: d.threadID, Limit: 500})
 			return err
@@ -131,4 +131,19 @@ func BenchmarkOpenWithIntegrityCheck(b *testing.B) {
 		}
 		s.Close()
 	}
+}
+
+// Many writers at once is what group commit is for.
+func BenchmarkInsertParallel(b *testing.B) {
+	d := seedHistory(b, benchMessages)
+	ctx := context.Background()
+	b.SetParallelism(32)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := d.store.InsertMessage(ctx, d.workspaceID, 0, d.a.ID, d.b.ID, "note", "a new message with a realistic length for an agent", 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

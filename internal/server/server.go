@@ -244,8 +244,12 @@ func (s *Server) withUser(next userHandler) http.HandlerFunc {
 			return
 		}
 		u, err := s.store.UserBySession(r.Context(), auth.HashToken(cookie.Value))
-		if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusUnauthorized, "log in first")
+			return
+		}
+		if err != nil {
+			s.internalError(w, r, err)
 			return
 		}
 		next(w, r, u)
@@ -260,9 +264,13 @@ func (s *Server) withMember(next memberHandler) http.HandlerFunc {
 			return
 		}
 		role, err := s.store.MemberRole(r.Context(), id, u.ID)
-		if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
 			// Same answer for "does not exist" and "not yours".
 			writeError(w, http.StatusNotFound, "workspace not found")
+			return
+		}
+		if err != nil {
+			s.internalError(w, r, err)
 			return
 		}
 		next(w, r, &memberContext{User: u, WorkspaceID: id, Role: role})
@@ -282,9 +290,13 @@ func (s *Server) withOwner(next memberHandler) http.HandlerFunc {
 func (s *Server) withAgent(next agentHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		a, err := s.store.AgentByToken(r.Context(), auth.HashToken(mcp.BearerToken(r)))
-		if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="agentic-chat"`)
 			writeError(w, http.StatusUnauthorized, "invalid or missing token")
+			return
+		}
+		if err != nil {
+			s.internalError(w, r, err) // not a 401, clients give up on a rejected token
 			return
 		}
 		if err := s.store.TouchAgent(r.Context(), a.ID); err != nil {
@@ -313,7 +325,7 @@ func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error
 		return
 	}
 	s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)
-	writeError(w, http.StatusInternalServerError, "something went wrong on the server, check its logs")
+	writeError(w, http.StatusServiceUnavailable, "something went wrong on the server, try again")
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, into any) bool {

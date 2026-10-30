@@ -56,7 +56,7 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 // on a hub becomes the admin. All of it happens in one transaction so two
 // simultaneous first registrations cannot both become admin.
 func (s *Store) CreateAccount(ctx context.Context, username, passwordHash, inviteHash, workspaceName string) (*User, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func scanUser(row *sql.Row) (*User, error) {
 // SetPassword replaces the password and logs the user out everywhere, except
 // for keepSession when it is not empty.
 func (s *Store) SetPassword(ctx context.Context, userID int64, passwordHash, keepSession string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -133,7 +133,7 @@ func (s *Store) SetPassword(ctx context.Context, userID int64, passwordHash, kee
 
 // CreateSession stores a login session.
 func (s *Store) CreateSession(ctx context.Context, tokenHash string, userID, expiresAt int64) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.w.ExecContext(ctx,
 		`INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
 		tokenHash, userID, nowMillis(), expiresAt)
 	return err
@@ -149,13 +149,13 @@ func (s *Store) UserBySession(ctx context.Context, tokenHash string) (*User, err
 
 // DeleteSession ends a login session.
 func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+	_, err := s.w.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
 	return err
 }
 
 // CreateWorkspace creates a workspace owned by the user.
 func (s *Store) CreateWorkspace(ctx context.Context, name string, user *User) (*Workspace, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +267,7 @@ func (s *Store) Members(ctx context.Context, workspaceID int64) ([]Member, error
 // RemoveMember removes a person from a workspace and revokes their agents there.
 // The last owner cannot be removed, otherwise nobody could manage the workspace.
 func (s *Store) RemoveMember(ctx context.Context, workspaceID, userID int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -309,7 +309,7 @@ var ErrInviteInvalid = errors.New("invite is not valid")
 // CreateInvite stores a new invite code hash.
 func (s *Store) CreateInvite(ctx context.Context, workspaceID, createdBy int64, codeHash string, maxUses int, expiresAt int64) (*Invite, error) {
 	now := nowMillis()
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.w.ExecContext(ctx, `
 		INSERT INTO invites (workspace_id, code_hash, created_by, max_uses, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?)`, workspaceID, codeHash, createdBy, maxUses, now, expiresAt)
 	if err != nil {
@@ -345,7 +345,7 @@ func (s *Store) Invites(ctx context.Context, workspaceID int64) ([]Invite, error
 
 // DeleteInvite removes an invite from a workspace.
 func (s *Store) DeleteInvite(ctx context.Context, workspaceID, inviteID int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM invites WHERE id = ? AND workspace_id = ?`, inviteID, workspaceID)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM invites WHERE id = ? AND workspace_id = ?`, inviteID, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -357,7 +357,7 @@ func (s *Store) DeleteInvite(ctx context.Context, workspaceID, inviteID int64) e
 
 // AcceptInvite adds an existing user to the workspace behind the invite code.
 func (s *Store) AcceptInvite(ctx context.Context, codeHash string, user *User) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
