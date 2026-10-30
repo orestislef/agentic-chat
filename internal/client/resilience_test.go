@@ -1,0 +1,517 @@
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/orestislef/agentic-chat/internal/auth"
+	"github.com/orestislef/agentic-chat/internal/hub"
+	"github.com/orestislef/agentic-chat/internal/server"
+	"github.com/orestislef/agentic-chat/internal/store"
+)
+
+// These tests break the connection on purpose, the way real networks do.
+
+type world struct {
+	t           *testing.T
+	store       *store.Store
+	dir         string
+	front, back string
+	backendID   int64
+	frontendID  int64
+}
+
+func newWorld(t *testing.T) *world {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "world.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	u, _ := s.CreateAccount(ctx, "owner", "h", "", "team")
+	ws, _ := s.WorkspacesForUser(ctx, u.ID)
+	w := &world{t: t, store: s, dir: dir}
+	w.front, _ = auth.NewToken("ac")
+	w.back, _ = auth.NewToken("ac")
+	a, err := s.CreateAgent(ctx, ws[0].ID, u.ID, "frontend", "", auth.HashToken(w.front))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.CreateAgent(ctx, ws[0].ID, u.ID, "backend", "", auth.HashToken(w.back))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.frontendID, w.backendID = a.ID, b.ID
+	return w
+}
+
+func (w *world) handler() http.Handler {
+	cfg := server.Config{DataDir: w.dir, DownloadsDir: w.dir, Registration: server.RegistrationInvite, Limits: hub.DefaultLimits()}
+	return server.New(cfg, w.store, quietLog()).Handler()
+}
+
+// messagesFrom counts what an agent has really stored, which is what duplicates show up in.
+func (w *world) messagesFrom(agentID int64) int {
+	w.t.Helper()
+	history, err := w.store.History(context.Background(), 1, store.HistoryFilter{AgentID: agentID, Limit: 500})
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	n := 0
+	for _, m := range history {
+		if m.FromID == agentID {
+			n++
+		}
+	}
+	return n
+}
+
+func fastSession(t *testing.T, url, token string) *session {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	s := &session{t: t, stdin: inW, lines: make(chan map[string]any, 64), done: make(chan struct{})}
+	bridge := NewBridge(Config{URL: url, Token: token}, inR, outW, quietLog())
+	bridge.retryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1600 * time.Millisecond}
+	bridge.pingEvery = 100 * time.Millisecond
+	bridge.pingTimeout = 300 * time.Millisecond
+	go func() {
+		bridge.Run(context.Background())
+		close(s.done)
+	}()
+	go readLines(t, outR, s.lines)
+	t.Cleanup(func() {
+		inW.Close()
+		select {
+		case <-s.done:
+		case <-time.After(5 * time.Second):
+			t.Error("bridge did not exit when stdin closed")
+		}
+		outW.Close()
+	})
+	return s
+}
+
+func readLines(t *testing.T, r io.Reader, lines chan<- map[string]any) {
+	dec := json.NewDecoder(r)
+	for {
+		var msg map[string]any
+		if err := dec.Decode(&msg); err != nil {
+			return
+		}
+		lines <- msg
+	}
+}
+
+func (s *session) nextPush(timeout time.Duration) map[string]any {
+	s.t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case m := <-s.lines:
+			if m["method"] == channelMethod {
+				return m["params"].(map[string]any)
+			}
+		case <-deadline:
+			s.t.Fatal("no push arrived")
+			return nil
+		}
+	}
+}
+
+// dropFirst loses the response of the first matching call after the hub has done
+// the work, which is the worst moment for a connection to die.
+func dropFirst(next http.Handler, tool string) http.Handler {
+	var dropped atomic.Bool
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mcp" || dropped.Load() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+		if !strings.Contains(string(body), `"`+tool+`"`) || !dropped.CompareAndSwap(false, true) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(httptest.NewRecorder(), r)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	})
+}
+
+func TestLostResponseDoesNotDuplicateTheMessage(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(dropFirst(w.handler(), "send_message"))
+	defer srv.Close()
+	s := fastSession(t, srv.URL, w.front)
+	s.initialize()
+
+	result := s.tool(2, "send_message", map[string]any{"to": "backend", "message": "only once please"})
+	if result["isError"] == true {
+		t.Fatalf("the retry should have hidden the drop: %s", toolText(result))
+	}
+	if n := w.messagesFrom(w.frontendID); n != 1 {
+		t.Fatalf("stored %d copies", n)
+	}
+}
+
+func TestLostInboxResponseDoesNotLoseMessages(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(dropFirst(w.handler(), "check_inbox"))
+	defer srv.Close()
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "do not lose me"})
+
+	back := fastSession(t, srv.URL, w.back)
+	back.initialize()
+	back.nextPush(5 * time.Second) // comes through the push path as well
+	result := back.tool(3, "check_inbox", nil)
+	if !strings.Contains(toolText(result), "do not lose me") {
+		t.Fatalf("message lost with the response: %s", toolText(result))
+	}
+}
+
+func TestProxyErrorsAreRetried(t *testing.T) {
+	w := newWorld(t)
+	var failures atomic.Int32
+	failures.Store(3)
+	real := w.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" && failures.Add(-1) >= 0 {
+			http.Error(rw, "<html>502 Bad Gateway</html>", http.StatusBadGateway)
+			return
+		}
+		real.ServeHTTP(rw, r)
+	}))
+	defer srv.Close()
+	s := fastSession(t, srv.URL, w.front)
+	s.initialize()
+	if result := s.tool(2, "list_agents", nil); result["isError"] == true {
+		t.Fatalf("502s should be retried: %s", toolText(result))
+	}
+}
+
+func TestCutOffResponseIsRetried(t *testing.T) {
+	w := newWorld(t)
+	var cut atomic.Bool
+	real := w.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" && cut.CompareAndSwap(false, true) {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.Write([]byte(`{"jsonrpc":"2.0","id":2,"resu`))
+			return
+		}
+		real.ServeHTTP(rw, r)
+	}))
+	defer srv.Close()
+	s := fastSession(t, srv.URL, w.front)
+	s.initialize()
+	if result := s.tool(2, "list_agents", nil); result["isError"] == true {
+		t.Fatalf("truncated JSON must not reach the session: %s", toolText(result))
+	}
+}
+
+func TestGivesUpWithAClearMessageWhenOffline(t *testing.T) {
+	s := fastSession(t, "http://127.0.0.1:1", "ac_x")
+	s.initialize()
+	result := s.tool(2, "send_message", map[string]any{"to": "backend", "message": "hi"})
+	text := toolText(result)
+	if result["isError"] != true || !strings.Contains(text, "get_history") {
+		t.Fatalf("result: %s", text)
+	}
+}
+
+// restartable is a hub that can be killed and started again on the same address.
+// It tracks the raw sockets, because a test server's own cleanup leaves upgraded
+// websockets running, which a real crash would not.
+type restartable struct {
+	w    *world
+	addr string
+	srv  *httptest.Server
+	ln   *trackingListener
+}
+
+type trackingListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.mu.Lock()
+		l.conns = append(l.conns, c)
+		l.mu.Unlock()
+	}
+	return c, err
+}
+
+func (l *trackingListener) cut() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.conns {
+		c.Close()
+	}
+}
+
+func startRestartable(t *testing.T, w *world) *restartable {
+	t.Helper()
+	r := &restartable{w: w, addr: "127.0.0.1:0"}
+	r.start()
+	t.Cleanup(func() { r.stop() })
+	return r
+}
+
+func (r *restartable) start() {
+	r.w.t.Helper()
+	var ln net.Listener
+	var err error
+	for i := 0; i < 50; i++ { // the old socket can take a moment to let go of the port
+		ln, err = net.Listen("tcp", r.addr)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		r.w.t.Fatal(err)
+	}
+	r.addr = ln.Addr().String()
+	r.ln = &trackingListener{Listener: ln}
+	r.srv = httptest.NewUnstartedServer(r.w.handler())
+	r.srv.Listener.Close()
+	r.srv.Listener = r.ln
+	r.srv.Start()
+}
+
+func (r *restartable) stop() {
+	if r.srv != nil {
+		r.ln.cut()
+		r.srv.CloseClientConnections()
+		r.srv.Close()
+		r.srv = nil
+	}
+}
+
+func (r *restartable) url() string {
+	return "http://" + r.addr
+}
+
+func TestBridgeReconnectsAfterHubRestartAndGetsQueuedMessages(t *testing.T) {
+	w := newWorld(t)
+	hubProc := startRestartable(t, w)
+	back := fastSession(t, hubProc.url(), w.back)
+	back.initialize()
+	time.Sleep(200 * time.Millisecond)
+
+	hubProc.stop()
+	time.Sleep(200 * time.Millisecond)
+	hubProc.start()
+
+	front := fastSession(t, hubProc.url(), w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "welcome back"})
+
+	push := back.nextPush(10 * time.Second)
+	if push["content"] != "welcome back" {
+		t.Fatalf("push: %v", push)
+	}
+}
+
+func TestAskSurvivesHubRestart(t *testing.T) {
+	w := newWorld(t)
+	hubProc := startRestartable(t, w)
+	front := fastSession(t, hubProc.url(), w.front)
+	back := fastSession(t, hubProc.url(), w.back)
+	front.initialize()
+	back.initialize()
+	waitOnline(t, nil, front, "backend")
+
+	answer := make(chan map[string]any, 1)
+	go func() {
+		answer <- front.tool(10, "ask_agent", map[string]any{"to": "backend", "message": "still there?", "wait_seconds": 20})
+	}()
+	push := back.nextPush(5 * time.Second)
+	messageID, _ := strconv.ParseInt(push["meta"].(map[string]any)["message_id"].(string), 10, 64)
+
+	// The hub dies while the asker is blocked in the tool call.
+	hubProc.stop()
+	time.Sleep(200 * time.Millisecond)
+	hubProc.start()
+
+	reply := back.tool(11, "reply", map[string]any{"message_id": messageID, "message": "yes, still here"})
+	if reply["isError"] == true {
+		t.Fatalf("reply: %s", toolText(reply))
+	}
+	select {
+	case result := <-answer:
+		if !strings.Contains(toolText(result), "yes, still here") {
+			t.Fatalf("ask result: %s", toolText(result))
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("ask never finished after the restart")
+	}
+	if n := w.messagesFrom(w.frontendID); n != 1 {
+		t.Fatalf("the question was stored %d times", n)
+	}
+}
+
+// blackholeProxy forwards TCP until told to silently swallow everything on the
+// connections it has so far: no close, no reset, like a dead network path.
+type blackholeProxy struct {
+	target string
+	ln     net.Listener
+	mu     sync.Mutex
+	links  []*atomic.Bool
+}
+
+func newBlackholeProxy(t *testing.T, target string) *blackholeProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &blackholeProxy{target: target, ln: ln}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			client, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			upstream, err := net.Dial("tcp", target)
+			if err != nil {
+				client.Close()
+				continue
+			}
+			dead := &atomic.Bool{}
+			p.mu.Lock()
+			p.links = append(p.links, dead)
+			p.mu.Unlock()
+			go pipe(client, upstream, dead)
+			go pipe(upstream, client, dead)
+		}
+	}()
+	return p
+}
+
+func pipe(from, to net.Conn, dead *atomic.Bool) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := from.Read(buf)
+		if err != nil {
+			if !dead.Load() {
+				to.Close()
+			}
+			return
+		}
+		if dead.Load() {
+			continue
+		}
+		if _, err := to.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func (p *blackholeProxy) swallowExisting() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, dead := range p.links {
+		dead.Store(true)
+	}
+}
+
+func TestDeadNetworkPathIsNoticedAndMessageStillArrives(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+	proxy := newBlackholeProxy(t, strings.TrimPrefix(srv.URL, "http://"))
+
+	back := fastSession(t, "http://"+proxy.ln.Addr().String(), w.back)
+	back.initialize()
+	time.Sleep(200 * time.Millisecond)
+
+	// The path dies with no signal to either side, and a message is sent into the void.
+	proxy.swallowExisting()
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "are you getting this"})
+
+	push := back.nextPush(10 * time.Second)
+	if push["content"] != "are you getting this" {
+		t.Fatalf("push: %v", push)
+	}
+}
+
+func TestRevokedTokenStopsReconnecting(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+	s := fastSession(t, srv.URL, "ac_never_valid")
+	s.initialize()
+	push := s.nextPush(5 * time.Second)
+	if !strings.Contains(push["content"].(string), "rejected") {
+		t.Fatalf("push: %v", push)
+	}
+	if push["meta"].(map[string]any)["kind"] != "system" {
+		t.Fatalf("meta: %v", push["meta"])
+	}
+}
+
+func TestWatchKeepsMessageUntilItHasIt(t *testing.T) {
+	w := newWorld(t)
+	var dropped atomic.Bool
+	real := w.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// The first inbox response dies on the way to the watcher.
+		if strings.HasPrefix(r.URL.Path, "/api/agent/inbox") && r.Method == http.MethodGet && dropped.CompareAndSwap(false, true) {
+			real.ServeHTTP(httptest.NewRecorder(), r)
+			conn, _, err := rw.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
+		real.ServeHTTP(rw, r)
+	}))
+	defer srv.Close()
+
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "survives the drop"})
+
+	var stderr strings.Builder
+	code := make(chan int, 1)
+	go func() { code <- RunWatch(context.Background(), Config{URL: srv.URL, Token: w.back}, &stderr) }()
+	select {
+	case got := <-code:
+		if got != exitWake || !strings.Contains(stderr.String(), "survives the drop") {
+			t.Fatalf("exit %d, stderr %q", got, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher never delivered")
+	}
+	unread, _ := w.store.Unread(context.Background(), w.backendID, 10)
+	if len(unread) != 0 {
+		t.Fatalf("confirmed message still unread: %+v", unread)
+	}
+}
