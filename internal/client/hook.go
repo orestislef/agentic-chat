@@ -48,6 +48,8 @@ func fetchInbox(ctx context.Context, cfg Config, wait int, exclusive bool) ([]in
 	case http.StatusOK:
 	case http.StatusConflict:
 		return nil, errWatcherReplaced
+	case http.StatusUnauthorized:
+		return nil, errTokenRejected
 	default:
 		return nil, fmt.Errorf("hub answered with status %d", resp.StatusCode)
 	}
@@ -124,17 +126,26 @@ func RunHook(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	event := input.Event
+	if event == "" {
+		event = "UserPromptSubmit"
+	}
 	messages, err := fetchInbox(ctx, cfg, 0, false)
+	if errors.Is(err, errTokenRejected) {
+		json.NewEncoder(stdout).Encode(map[string]any{
+			"hookSpecificOutput": map[string]any{
+				"hookEventName":     event,
+				"additionalContext": "agentic-chat: the hub rejected this agent's token, it was revoked or replaced. This session cannot reach other agents until your user sets it up again. Tell them.",
+			},
+		})
+		return 0
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agentic-chat:", err)
 		return 0
 	}
 	if len(messages) == 0 {
 		return 0
-	}
-	event := input.Event
-	if event == "" {
-		event = "UserPromptSubmit"
 	}
 	if err := confirmInbox(ctx, cfg, messages); err != nil {
 		fmt.Fprintln(stderr, "agentic-chat:", err)
@@ -166,7 +177,9 @@ func RunWatch(ctx context.Context, cfg Config, stderr io.Writer) int {
 			return 0
 		}
 		messages, err := fetchInbox(ctx, cfg, watchPollSeconds, true)
-		if errors.Is(err, errWatcherReplaced) {
+		// Waking the session here would loop, because each turn starts a new watcher.
+		// The next prompt and any tool call report a rejected token instead.
+		if errors.Is(err, errWatcherReplaced) || errors.Is(err, errTokenRejected) {
 			return 0
 		}
 		if err != nil {

@@ -553,3 +553,75 @@ func TestStandbyDialLeavesCurrentHolderAlone(t *testing.T) {
 		t.Fatalf("standby dial should be refused, got %v %+v", err, resp)
 	}
 }
+
+func TestCancelledInviteStopsWorking(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	var created struct {
+		Code   string `json:"code"`
+		Invite struct {
+			ID int64 `json:"id"`
+		} `json:"invite"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 5}, http.StatusCreated, &created)
+	var list []store.Invite
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/invites", nil, http.StatusOK, &list)
+	if len(list) != 1 {
+		t.Fatalf("invites: %+v", list)
+	}
+	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/invites/"+strconv.FormatInt(created.Invite.ID, 10), nil, http.StatusNoContent, nil)
+	status, _ := ts.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "late", "password": password, "invite": created.Code})
+	if status != http.StatusBadRequest {
+		t.Fatalf("cancelled invite: status %d", status)
+	}
+}
+
+func TestExistingUserJoinsThroughInvite(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
+	owner := ts.register("owner", "")
+	other := ts.register("other", "")
+	ws := owner.workspaceID()
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 2}, http.StatusCreated, &created)
+	other.mustJSON(http.MethodPost, "/api/invites/accept", map[string]string{"code": created.Code}, http.StatusOK, nil)
+	if status, _ := other.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusOK {
+		t.Fatalf("joined member cannot read: %d", status)
+	}
+	// Joining twice is refused and does not use up a second place.
+	if status, _ := other.do(http.MethodPost, "/api/invites/accept", map[string]string{"code": created.Code}); status != http.StatusConflict {
+		t.Fatalf("second join: %d", status)
+	}
+}
+
+func TestRemovingAMemberRevokesTheirAgents(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
+	guest := ts.register("guest", created.Code)
+	_, token := guest.createAgent(ws, "guestbot")
+
+	var members []store.Member
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/members", nil, http.StatusOK, &members)
+	for _, m := range members {
+		if m.Username == "guest" {
+			owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/members/"+strconv.FormatInt(m.UserID, 10), nil, http.StatusNoContent, nil)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/me", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("agent of a removed member still works: %d", resp.StatusCode)
+	}
+}

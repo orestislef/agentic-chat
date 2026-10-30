@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -446,5 +447,66 @@ func TestKickCutsEverythingOpen(t *testing.T) {
 	case <-sub.Closed:
 	case <-time.After(time.Second):
 		t.Fatal("browser subscription stayed open")
+	}
+}
+
+func TestRemovingAnAgentWakesWhoeverWaitsForIt(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := context.Background()
+	ask, _ := e.hub.Send(ctx, e.frontend, "backend", "ask", "will you answer", 0)
+	errs := make(chan error, 1)
+	go func() {
+		_, err := e.hub.WaitReply(ctx, e.frontend, ask.ID, 30*time.Second)
+		errs <- err
+	}()
+	waitForWaiter(t, e.hub, ask.ID)
+
+	if err := e.store.RevokeAgent(ctx, e.backend.WorkspaceID, e.backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.hub.AgentGone(ctx, e.backend)
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrRecipientGone) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the asker kept waiting for an agent that no longer exists")
+	}
+	// Asking about it later must not wait either.
+	if _, err := e.hub.WaitReply(ctx, e.frontend, ask.ID, 30*time.Second); !errors.Is(err, ErrRecipientGone) {
+		t.Fatalf("second wait: %v", err)
+	}
+}
+
+func TestAskerGetsNoticeOnlyForUnansweredQuestions(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := context.Background()
+	answered, _ := e.hub.Send(ctx, e.frontend, "backend", "ask", "one", 0)
+	e.hub.Reply(ctx, e.backend, answered.ID, "done")
+	open, _ := e.hub.Send(ctx, e.frontend, "backend", "ask", "two", 0)
+	e.hub.Send(ctx, e.frontend, "backend", "note", "just so you know", 0)
+
+	conn, _ := e.hub.Attach(ctx, e.frontend)
+	e.hub.Ack(ctx, e.frontend.ID, answered.ID+1)
+	for len(conn.C) > 0 { // what the attach queued up
+		<-conn.C
+	}
+	e.hub.AgentGone(ctx, e.backend)
+
+	select {
+	case m := <-conn.C:
+		if m.Kind != "system" || m.ID != 0 {
+			t.Fatalf("not a notice: %+v", m)
+		}
+		if !strings.Contains(m.Body, "backend was removed") || !strings.Contains(m.Body, strconv.FormatInt(open.ID, 10)) {
+			t.Fatalf("notice: %s", m.Body)
+		}
+		if strings.Contains(m.Body, strconv.FormatInt(answered.ID, 10)+",") {
+			t.Fatalf("notice names an answered question: %s", m.Body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no notice")
 	}
 }

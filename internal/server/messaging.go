@@ -81,6 +81,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request, c *me
 		s.internalError(w, r, err)
 		return
 	}
+	s.hub.AgentsChanged(c.WorkspaceID)
 	writeJSON(w, http.StatusCreated, map[string]any{"agent": agentView{Agent: *agent, State: hub.StateOffline}, "token": token})
 }
 
@@ -117,6 +118,7 @@ func (s *Server) handleRevokeAgent(w http.ResponseWriter, r *http.Request, c *me
 		return
 	}
 	s.hub.Kick(c.WorkspaceID, agent.ID)
+	s.hub.AgentGone(r.Context(), agent)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -291,7 +293,7 @@ func pingConn(ctx context.Context, conn *websocket.Conn) error {
 
 // AgentFrame is what travels over the agent websocket, in both directions.
 type AgentFrame struct {
-	Type    string         `json:"type"` // "message" from the hub, "ack" from the client
+	Type    string         `json:"type"` // "message" or "notice" from the hub, "ack" from the client
 	Message *store.Message `json:"message,omitempty"`
 	ID      int64          `json:"id,omitempty"`
 }
@@ -345,7 +347,11 @@ func (s *Server) handleAgentSocket(w http.ResponseWriter, r *http.Request, a *st
 	for {
 		select {
 		case m := <-live.C:
-			if err := writeFrame(ctx, conn, AgentFrame{Type: "message", Message: &m}); err != nil {
+			frame := AgentFrame{Type: "message", Message: &m}
+			if m.ID == 0 { // from the hub itself, not stored and not acknowledged
+				frame.Type = "notice"
+			}
+			if err := writeFrame(ctx, conn, frame); err != nil {
 				return
 			}
 		case <-live.Closed:

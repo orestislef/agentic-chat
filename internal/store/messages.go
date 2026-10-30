@@ -459,3 +459,16 @@ func (s *Store) PruneMessages(ctx context.Context, olderThan int64) (int64, erro
 		}
 	}
 }
+
+// UnansweredAsks lists recent questions to an agent that never got a reply.
+func (s *Store) UnansweredAsks(ctx context.Context, agentID int64, limit int) ([]Message, error) {
+	since := nowMillis() - 7*24*60*60*1000
+	rows, err := s.db.QueryContext(ctx, messageSelect+`
+		WHERE m.to_agent_id = ? AND m.kind = 'ask' AND m.created_at > ?
+		AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.in_reply_to = m.id)
+		ORDER BY m.id LIMIT ?`, agentID, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanMessages(rows)
+}

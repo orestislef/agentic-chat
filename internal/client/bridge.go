@@ -455,6 +455,10 @@ func (b *Bridge) connectPush(ctx context.Context, standby bool, onConnected func
 		if err := wsjson.Read(ctx, conn, &frame); err != nil {
 			return true, err
 		}
+		if frame.Type == "notice" && frame.Message != nil {
+			b.notifySystem(frame.Message.Body)
+			continue
+		}
 		if frame.Type != "message" || frame.Message == nil {
 			continue
 		}

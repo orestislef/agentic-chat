@@ -314,9 +314,10 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, c *m
 		s.internalError(w, r, err)
 		return
 	}
-	for _, a := range agents {
-		if a.UserID == target {
-			s.hub.Kick(c.WorkspaceID, a.ID)
+	for i := range agents {
+		if agents[i].UserID == target {
+			s.hub.Kick(c.WorkspaceID, agents[i].ID)
+			s.hub.AgentGone(r.Context(), &agents[i])
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)

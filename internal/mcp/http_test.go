@@ -21,6 +21,7 @@ import (
 type fixture struct {
 	url                   string
 	frontToken, backToken string
+	revokeBackend         func(*testing.T)
 }
 
 func setup(t *testing.T) *fixture {
@@ -38,7 +39,13 @@ func setup(t *testing.T) *fixture {
 	list, _ := s.WorkspacesForUser(ctx, u.ID)
 	f := &fixture{frontToken: "ac_front", backToken: "ac_back"}
 	s.CreateAgent(ctx, list[0].ID, u.ID, "frontend", "web ui", auth.HashToken(f.frontToken))
-	s.CreateAgent(ctx, list[0].ID, u.ID, "backend", "api", auth.HashToken(f.backToken))
+	back, _ := s.CreateAgent(ctx, list[0].ID, u.ID, "backend", "api", auth.HashToken(f.backToken))
+	f.revokeBackend = func(t *testing.T) {
+		t.Helper()
+		if err := s.RevokeAgent(ctx, list[0].ID, back.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewHandler(s, hub.New(s, hub.DefaultLimits(), log), log))
 	t.Cleanup(srv.Close)
@@ -231,5 +238,19 @@ func TestGetIsNotAllowed(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatal(fmt.Sprint("status ", resp.StatusCode))
+	}
+}
+
+func TestWaitingOnARemovedAgentSaysSo(t *testing.T) {
+	f := setup(t)
+	asked := f.call(t, f.frontToken, "ask_agent", map[string]any{"to": "backend", "message": "q"})
+	f.revokeBackend(t)
+	got := f.call(t, f.frontToken, "wait_for_reply", map[string]any{"message_id": asked["message_id"], "wait_seconds": 30})
+	if got["status"] != "unreachable" || !strings.Contains(got["note"].(string), "tell your user") {
+		t.Fatalf("got %v", got)
+	}
+	text, isErr := f.callRaw(t, f.frontToken, "ask_agent", map[string]any{"to": "backend", "message": "again"})
+	if !isErr || !strings.Contains(text, "list_agents") {
+		t.Fatalf("asking a removed agent: %q %v", text, isErr)
 	}
 }

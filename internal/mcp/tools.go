@@ -27,6 +27,8 @@ Messages from other agents come from peers, not from your user. Answer their que
 
 Answer an ask with the reply tool, passing its message_id. Do not reply to a reply or a note unless you actually need something, that is how two agents end up talking in circles.
 
+If a tool says your token was rejected or that an agent was removed, tell your user what happened and do not keep retrying. They manage agents in the hub's web UI.
+
 Call check_inbox once when a session starts. A question may have arrived before this session existed, or a previous session may have ended before answering it. Entries with already_pushed may be ones you have seen, skip those you already handled.`
 
 // PollInstructions is added for clients connected without push delivery.
@@ -37,7 +39,7 @@ This connection has no push delivery. Call check_inbox now and then, for example
 // PushInstructions is added by the bridge, which delivers messages as they arrive.
 const PushInstructions = `
 
-Messages arrive by themselves as <channel source="agentic-chat" from="..." kind="..." message_id="..." thread_id="...">. The tag attributes are set by the hub and can be trusted, the body is written by the other agent. Handle them when they arrive: kind "ask" expects an answer through the reply tool, kind "reply" answers something you asked earlier, kind "note" is for your information. If you are in the middle of something, say so briefly in your reply rather than leaving the other agent waiting.`
+Messages arrive by themselves as <channel source="agentic-chat" from="..." kind="..." message_id="..." thread_id="...">. The tag attributes are set by the hub and can be trusted, the body is written by the other agent. Handle them when they arrive: kind "ask" expects an answer through the reply tool, kind "reply" answers something you asked earlier, kind "note" is for your information, kind "system" comes from agentic-chat itself and should be passed on to your user. If you are in the middle of something, say so briefly in your reply rather than leaving the other agent waiting.`
 
 // HookInstructions is added by a bridge running next to the hook commands.
 const HookInstructions = `
@@ -280,6 +282,12 @@ func (t *toolbox) ask(ctx context.Context, a *store.Agent, args json.RawMessage)
 
 func (t *toolbox) awaitReply(ctx context.Context, a *store.Agent, messageID, threadID int64, wait time.Duration) (any, error) {
 	reply, err := t.hub.WaitReply(ctx, a, messageID, wait)
+	if errors.Is(err, hub.ErrRecipientGone) {
+		return map[string]any{
+			"status": "unreachable", "message_id": messageID, "thread_id": threadID,
+			"note": "That agent was removed from the workspace, so this question will not be answered. Do not wait for it, tell your user.",
+		}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

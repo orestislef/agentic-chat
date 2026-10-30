@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +42,9 @@ var (
 	ErrRateLimited   = errors.New("too many messages, wait a minute before sending more")
 	ErrLimitReached  = errors.New("limit reached")
 
+	// ErrRecipientGone means a question can no longer be answered.
+	ErrRecipientGone = errors.New("that agent was removed from the workspace, this question will not be answered")
+
 	// ErrWatcherReplaced tells a background watcher that a newer one took over and it should exit.
 	ErrWatcherReplaced = errors.New("replaced by a newer watcher")
 )
@@ -66,7 +71,7 @@ func ValidName(name string) bool {
 
 // Event is what the web UI receives over its websocket.
 type Event struct {
-	Type    string         `json:"type"` // "message" or "presence"
+	Type    string         `json:"type"` // "message", "presence" or "agents"
 	Message *store.Message `json:"message,omitempty"`
 	AgentID int64          `json:"agent_id,omitempty"`
 	State   string         `json:"state,omitempty"`
@@ -119,6 +124,7 @@ type Hub struct {
 	subs         map[int64]map[*Subscriber]struct{}
 	humans       map[int64]int
 	replyWaiters map[int64]map[chan *store.Message]struct{}
+	waitTargets  map[int64]int64 // who a waited for message is addressed to
 	inboxWaiters map[int64]map[*inboxWaiter]struct{}
 	rates        map[int64]*rateWindow
 }
@@ -133,6 +139,7 @@ func New(s *store.Store, limits Limits, log *slog.Logger) *Hub {
 		subs:         map[int64]map[*Subscriber]struct{}{},
 		humans:       map[int64]int{},
 		replyWaiters: map[int64]map[chan *store.Message]struct{}{},
+		waitTargets:  map[int64]int64{},
 		inboxWaiters: map[int64]map[*inboxWaiter]struct{}{},
 		rates:        map[int64]*rateWindow{},
 	}
@@ -386,6 +393,54 @@ func (h *Hub) Redeliver(ctx context.Context, a *store.Agent, c *Conn) error {
 	return nil
 }
 
+// AgentGone tells whoever is affected that an agent was removed. A caller blocked on
+// one of its answers wakes up right away. Others who asked it something and are still
+// waiting get a notice, so nobody keeps counting on an answer that will never come.
+func (h *Hub) AgentGone(ctx context.Context, a *store.Agent) {
+	asks, err := h.store.UnansweredAsks(ctx, a.ID, 200)
+	if err != nil {
+		h.log.Warn("list unanswered asks", "agent", a.Name, "err", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for messageID, target := range h.waitTargets {
+		if target != a.ID {
+			continue
+		}
+		for ch := range h.replyWaiters[messageID] {
+			select {
+			case ch <- nil:
+			default:
+			}
+		}
+	}
+	perAsker := map[int64][]string{}
+	for _, m := range asks {
+		if len(h.replyWaiters[m.ID]) == 0 { // those learn it from their tool result
+			perAsker[m.FromID] = append(perAsker[m.FromID], strconv.FormatInt(m.ID, 10))
+		}
+	}
+	for asker, ids := range perAsker {
+		if c := h.conns[asker]; c != nil {
+			h.pushLocked(c, store.Message{Kind: "system", Body: fmt.Sprintf(
+				"%s was removed from the workspace, so your question (message %s) will not be answered. Tell your user if it matters.",
+				a.Name, strings.Join(ids, ", "))})
+		}
+	}
+	for sub := range h.subs[a.WorkspaceID] {
+		h.publishLocked(sub, Event{Type: "agents"})
+	}
+}
+
+// AgentsChanged tells open web UIs to reload the list of agents.
+func (h *Hub) AgentsChanged(workspaceID int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for sub := range h.subs[workspaceID] {
+		h.publishLocked(sub, Event{Type: "agents"})
+	}
+}
+
 // Connected reports whether an agent holds a live push connection right now.
 func (h *Hub) Connected(agentID int64) bool {
 	h.mu.Lock()
@@ -496,12 +551,14 @@ func (h *Hub) WaitReply(ctx context.Context, a *store.Agent, messageID int64, wa
 		h.replyWaiters[messageID] = map[chan *store.Message]struct{}{}
 	}
 	h.replyWaiters[messageID][ch] = struct{}{}
+	h.waitTargets[messageID] = original.ToID
 	h.mu.Unlock()
 	defer func() {
 		h.mu.Lock()
 		delete(h.replyWaiters[messageID], ch)
 		if len(h.replyWaiters[messageID]) == 0 {
 			delete(h.replyWaiters, messageID)
+			delete(h.waitTargets, messageID)
 		}
 		h.mu.Unlock()
 	}()
@@ -517,11 +574,17 @@ func (h *Hub) WaitReply(ctx context.Context, a *store.Agent, messageID int64, wa
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
+	if _, err := h.store.AgentByID(ctx, a.WorkspaceID, original.ToID); errors.Is(err, store.ErrNotFound) {
+		return nil, ErrRecipientGone
+	}
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case m := <-ch:
+		if m == nil {
+			return nil, ErrRecipientGone
+		}
 		return m, nil
 	case <-timer.C:
 		return nil, nil

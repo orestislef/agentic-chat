@@ -3,9 +3,11 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
@@ -661,4 +663,94 @@ func TestShortLivedProcessDoesNotDisturbRunningSession(t *testing.T) {
 	if got["content"] != "still here?" {
 		t.Fatalf("running session was disturbed: %v", got)
 	}
+}
+
+func TestAskerIsToldWhenTheOtherAgentIsRemoved(t *testing.T) {
+	w := newWorld(t)
+	h := w.handler()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// The question is sent while backend is offline, so nobody is blocked on it.
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	time.Sleep(200 * time.Millisecond)
+	var asked map[string]any
+	json.Unmarshal([]byte(toolText(front.tool(2, "ask_agent", map[string]any{"to": "backend", "message": "are you there", "wait_seconds": 0}))), &asked)
+	if asked["status"] != "queued" {
+		t.Fatalf("asked: %v", asked)
+	}
+
+	// Removing it the way the web UI does: token gone, then the announcement.
+	if err := w.removeBackendThroughAPI(srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	json.Unmarshal([]byte(toolText(front.tool(3, "wait_for_reply", map[string]any{"message_id": asked["message_id"], "wait_seconds": 5}))), &got)
+	if got["status"] != "unreachable" {
+		t.Fatalf("got %v", got)
+	}
+	notice := front.nextPush(5 * time.Second)
+	if notice["meta"].(map[string]any)["kind"] != "system" || !strings.Contains(notice["content"].(string), "backend was removed") {
+		t.Fatalf("notice: %v", notice)
+	}
+}
+
+func TestWatcherStopsOnRejectedTokenAndHookSaysSo(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+	cfg := Config{URL: srv.URL, Token: "ac_rejected"}
+
+	done := make(chan int, 1)
+	go func() { done <- RunWatch(context.Background(), cfg, io.Discard) }()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("waking here would loop forever, exit %d", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("watcher keeps retrying a token that will never work")
+	}
+
+	var stdout, stderr strings.Builder
+	if code := RunHook(context.Background(), cfg, strings.NewReader(`{"hook_event_name":"UserPromptSubmit"}`), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(stdout.String(), "rejected") || !strings.Contains(stdout.String(), "Tell them") {
+		t.Fatalf("hook output: %q", stdout.String())
+	}
+}
+
+// removeBackendThroughAPI signs in like the web UI and removes the agent.
+func (w *world) removeBackendThroughAPI(base string) error {
+	ctx := context.Background()
+	hash, err := auth.HashPassword("a long enough password")
+	if err != nil {
+		return err
+	}
+	u, err := w.store.UserByUsername(ctx, "owner")
+	if err != nil {
+		return err
+	}
+	if err := w.store.SetPassword(ctx, u.ID, hash, ""); err != nil {
+		return err
+	}
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Jar: jar}
+	resp, err := c.Post(base+"/api/auth/login", "application/json", strings.NewReader(`{"username":"owner","password":"a long enough password"}`))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	req, _ := http.NewRequest(http.MethodDelete, base+"/api/workspaces/1/agents/"+strconv.FormatInt(w.backendID, 10), nil)
+	resp, err = c.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("remove agent: status %d", resp.StatusCode)
+	}
+	return nil
 }
