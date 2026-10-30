@@ -88,6 +88,8 @@ People can also sign up on the way through connecting a client, under the same r
 create invite links under **Invite someone**, and can see and cancel open ones
 there. A link for someone who already has an account adds them after they log in.
 
+Owners can delete a workspace under **Invite someone**. An account always keeps at least one.
+
 There is no email on this hub. If someone forgets their password:
 
 ```sh

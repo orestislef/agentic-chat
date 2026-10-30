@@ -210,6 +210,15 @@ paths:
         "200": { description: Joined }
         "400": { description: Expired, used up or wrong }
         "409": { description: Already a member }
+  /api/workspaces/{id}:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    delete:
+      summary: Delete a workspace and everything in it, owners only
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Deleted }
+        "403": { description: Not an owner }
+        "409": { description: It is the only workspace of this account }
   /api/workspaces/{id}/members:
     parameters: [{ $ref: "#/components/parameters/workspace" }]
     get:

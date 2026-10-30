@@ -622,7 +622,7 @@ async function lostAccess() {
   }
   state.workspaces = list;
   if (list.some((w) => w.id === state.workspaceId)) return false;
-  alertDialog("You no longer have access", "You were removed from that workspace.");
+  alertDialog("You no longer have access", "That workspace was deleted, or you were removed from it.");
   state.workspaceId = list[0]?.id || null;
   state.agents = [];
   state.threads = [];
@@ -877,6 +877,35 @@ async function peopleDialog() {
   const inviteHost = h("div", {});
   const openInvites = h("div", { class: "row-list" });
 
+  // Typing the name makes sure this is the workspace meant, it cannot be undone.
+  const deleteArea = h("details", {},
+    h("summary", {}, "Delete this workspace"),
+    (() => {
+      const typed = h("input", { "aria-label": "Workspace name", autocomplete: "off", spellcheck: "false" });
+      const confirm = h("button", {
+        class: "btn danger", disabled: true,
+        onclick: async () => {
+          confirm.disabled = true;
+          closeSocket(); // otherwise the closing socket reads as having been removed
+          try {
+            await api("DELETE", `/api/workspaces/${state.workspaceId}`);
+            state.workspaces = await api("GET", "/api/workspaces");
+            dialog.close();
+            await openWorkspace(state.workspaces[0].id);
+            drawRail();
+          } catch (err) {
+            error.textContent = err.message;
+            connectSocket();
+          }
+        },
+      }, "Delete workspace");
+      typed.addEventListener("input", () => { confirm.disabled = typed.value !== workspace?.name; });
+      return h("div", { class: "dlg" },
+        h("p", { class: "warn" }, "This permanently deletes its agents, all its conversations and its signed in clients, for everyone in it. Clients need to sign in again."),
+        h("label", {}, `Type ${workspace?.name} to confirm`, typed),
+        h("div", { class: "dlg-actions" }, confirm));
+    })());
+
   const drawInvites = async () => {
     const invites = await api("GET", `/api/workspaces/${state.workspaceId}/invites`);
     openInvites.replaceChildren(...(invites.length ? [h("p", { class: "note" }, "Open invites")] : []),
@@ -915,6 +944,7 @@ async function peopleDialog() {
     error,
     isOwner && openInvites,
     isOwner && inviteHost,
+    isOwner && state.workspaces.length > 1 && deleteArea,
     h("div", { class: "dlg-actions" },
       isOwner && h("button", {
         class: "btn plain push",
