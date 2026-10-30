@@ -24,6 +24,7 @@ type Config struct {
 	DownloadsDir  string
 	Registration  string
 	RetentionDays int
+	BackupKeep    int
 	TrustProxy    bool
 	Limits        hub.Limits
 }
@@ -40,6 +41,7 @@ func ConfigFromEnv() (Config, error) {
 		DataDir:      env("AC_DATA_DIR", "./data"),
 		DownloadsDir: env("AC_DOWNLOADS_DIR", "./dist"),
 		Registration: strings.ToLower(env("AC_REGISTRATION", RegistrationInvite)),
+		BackupKeep:   7,
 		Limits:       hub.DefaultLimits(),
 	}
 	switch c.Registration {
@@ -53,6 +55,7 @@ func ConfigFromEnv() (Config, error) {
 		min  int
 	}{
 		{"AC_RETENTION_DAYS", &c.RetentionDays, 0},
+		{"AC_BACKUP_KEEP", &c.BackupKeep, 0},
 		{"AC_MAX_THREAD_MESSAGES", &c.Limits.MaxThreadMessages, 2},
 		{"AC_MAX_MESSAGE_BYTES", &c.Limits.MaxMessageBytes, 1},
 		{"AC_MESSAGES_PER_MINUTE", &c.Limits.MessagesPerMinute, 1},

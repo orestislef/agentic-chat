@@ -252,10 +252,29 @@ func (s *Server) handleWorkspaceSocket(w http.ResponseWriter, r *http.Request, c
 			if err := pingConn(ctx, conn); err != nil {
 				return
 			}
+			// A logout or an expired session must end the stream too, not only the
+			// next API call. Access is checked again while the socket stays open.
+			if !s.stillMember(ctx, r, c) {
+				conn.Close(websocket.StatusPolicyViolation, "log in again")
+				return
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (s *Server) stillMember(ctx context.Context, r *http.Request, c *memberContext) bool {
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return false
+	}
+	u, err := s.store.UserBySession(ctx, auth.HashToken(cookie.Value))
+	if err != nil {
+		return false
+	}
+	_, err = s.store.MemberRole(ctx, c.WorkspaceID, u.ID)
+	return err == nil
 }
 
 func writeFrame(ctx context.Context, conn *websocket.Conn, v any) error {
@@ -333,6 +352,9 @@ func (s *Server) handleAgentSocket(w http.ResponseWriter, r *http.Request, a *st
 			if err := s.store.TouchAgent(ctx, a.ID); err != nil && ctx.Err() == nil {
 				s.log.Warn("touch agent", "err", err)
 			}
+			if err := s.hub.Redeliver(ctx, a, live); err != nil && ctx.Err() == nil {
+				s.log.Warn("redeliver", "agent", a.Name, "err", err)
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -349,12 +371,20 @@ func closeCode(reason string) websocket.StatusCode {
 	return closeOverflow
 }
 
+// handleAgentMe lets a client check its token without touching the inbox.
+func (s *Server) handleAgentMe(w http.ResponseWriter, r *http.Request, a *store.Agent) {
+	writeJSON(w, http.StatusOK, a)
+}
+
 // handleAgentInbox serves the hook command: unread messages, optionally waiting
 // for one. It reports a replaced watcher with 409 so the old process can exit.
 func (s *Server) handleAgentInbox(w http.ResponseWriter, r *http.Request, a *store.Agent) {
-	wait := time.Duration(queryInt(r, "wait", 0, 0, inboxWaitCap)) * time.Second
-	exclusive := r.URL.Query().Get("exclusive") == "1"
-	messages, err := s.hub.Inbox(r.Context(), a, queryInt(r, "limit", 20, 1, 100), wait, exclusive)
+	messages, err := s.hub.Inbox(r.Context(), a, hub.InboxOptions{
+		Limit:     queryInt(r, "limit", 20, 1, 100),
+		Wait:      time.Duration(queryInt(r, "wait", 0, 0, inboxWaitCap)) * time.Second,
+		Exclusive: r.URL.Query().Get("exclusive") == "1",
+		Peek:      r.URL.Query().Get("peek") == "1",
+	})
 	if errors.Is(err, hub.ErrWatcherReplaced) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -364,4 +394,23 @@ func (s *Server) handleAgentInbox(w http.ResponseWriter, r *http.Request, a *sto
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": messages})
+}
+
+// handleAgentInboxAck confirms messages fetched with peek=1.
+func (s *Server) handleAgentInboxAck(w http.ResponseWriter, r *http.Request, a *store.Agent) {
+	var in struct {
+		IDs []int64 `json:"ids"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if len(in.IDs) > 100 {
+		writeError(w, http.StatusBadRequest, "confirm at most 100 messages at once")
+		return
+	}
+	if err := s.hub.MarkRead(r.Context(), a, in.IDs...); err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

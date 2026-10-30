@@ -425,3 +425,98 @@ func TestSecurityHeadersPresent(t *testing.T) {
 		}
 	}
 }
+
+func dialWorkspace(t *testing.T, c *client, ws string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(c.ts.url, "http")+"/api/workspaces/"+ws+"/ws", &websocket.DialOptions{
+		HTTPClient: c.http,
+		HTTPHeader: http.Header{"Origin": {c.ts.url}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.CloseNow() })
+	return conn
+}
+
+func TestRemovedMemberLosesLiveStreamAtOnce(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
+	guest := ts.register("guest", created.Code)
+	conn := dialWorkspace(t, guest, ws)
+
+	// Presence events flow while the guest is a member.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var members []store.Member
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/members", nil, http.StatusOK, &members)
+	var guestID int64
+	for _, m := range members {
+		if m.Username == "guest" {
+			guestID = m.UserID
+		}
+	}
+	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/members/"+strconv.FormatInt(guestID, 10), nil, http.StatusNoContent, nil)
+
+	for {
+		_, _, err := conn.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				t.Fatal("the stream stayed open after the member was removed")
+			}
+			break
+		}
+	}
+	if status, _ := guest.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusNotFound {
+		t.Fatalf("removed member can still read messages: %d", status)
+	}
+}
+
+func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
+	alice := ts.register("alice", "")
+	bob := ts.register("bob", "")
+	aliceWs := alice.workspaceID()
+	_, aliceToken := alice.createAgent(aliceWs, "secretbot")
+	_, bobToken := bob.createAgent(bob.workspaceID(), "bobbot")
+
+	var sent store.Message
+	alice.mustJSON(http.MethodPost, "/api/workspaces/"+aliceWs+"/messages", map[string]string{"to": "secretbot", "body": "private plans"}, http.StatusCreated, &sent)
+
+	// Bob's agent tries to confirm Alice's message as read.
+	body, _ := json.Marshal(map[string]any{"ids": []int64{sent.ID}})
+	req, _ := http.NewRequest(http.MethodPost, ts.url+"/api/agent/inbox/ack", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+bobToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The real recipient still has it unread, and only the recipient sees it.
+	inbox := func(token string) string {
+		req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/inbox?peek=1", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return string(data)
+	}
+	if !strings.Contains(inbox(aliceToken), "private plans") {
+		t.Fatal("another agent was able to mark the message read")
+	}
+	if strings.Contains(inbox(bobToken), "private plans") {
+		t.Fatal("message leaked to another workspace")
+	}
+}

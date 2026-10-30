@@ -273,7 +273,7 @@ func TestInboxWaitWakesOnMessage(t *testing.T) {
 	ctx := context.Background()
 	got := make(chan []store.Message, 1)
 	go func() {
-		msgs, err := e.hub.Inbox(ctx, e.backend, 10, 5*time.Second, false)
+		msgs, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Wait: 5 * time.Second})
 		if err != nil {
 			t.Error(err)
 		}
@@ -299,13 +299,13 @@ func TestExclusiveWatcherReplacesOlderOne(t *testing.T) {
 	ctx := context.Background()
 	older := make(chan error, 1)
 	go func() {
-		_, err := e.hub.Inbox(ctx, e.backend, 10, 5*time.Second, true)
+		_, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Wait: 5 * time.Second, Exclusive: true})
 		older <- err
 	}()
 	time.Sleep(30 * time.Millisecond)
 	newer := make(chan []store.Message, 1)
 	go func() {
-		msgs, _ := e.hub.Inbox(ctx, e.backend, 10, 5*time.Second, true)
+		msgs, _ := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Wait: 5 * time.Second, Exclusive: true})
 		newer <- msgs
 	}()
 	select {
@@ -325,5 +325,121 @@ func TestExclusiveWatcherReplacesOlderOne(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("newest watcher did not get the message")
+	}
+}
+
+func TestRedeliverDrainsLargeBacklog(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MessagesPerMinute = 1000
+	e := setup(t, limits)
+	ctx := context.Background()
+	total := pushBuffer/2 + 20
+	for i := 0; i < total; i++ {
+		if _, err := e.hub.Send(ctx, e.frontend, "backend", "note", "x", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := e.hub.Attach(ctx, e.backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]bool{}
+	drain := func() {
+		for {
+			select {
+			case m := <-conn.C:
+				got[m.ID] = true
+				e.hub.Ack(ctx, e.backend.ID, m.ID)
+			default:
+				return
+			}
+		}
+	}
+	drain()
+	if len(got) >= total {
+		t.Fatalf("test needs a backlog larger than one batch, got %d of %d", len(got), total)
+	}
+	if err := e.hub.Redeliver(ctx, e.backend, conn); err != nil {
+		t.Fatal(err)
+	}
+	drain()
+	if len(got) != total {
+		t.Fatalf("delivered %d of %d", len(got), total)
+	}
+}
+
+func TestRetriedSendIsStoredOnce(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := WithIdempotencyKey(context.Background(), "key-1")
+	conn, _ := e.hub.Attach(context.Background(), e.backend)
+	first, err := e.hub.Send(ctx, e.frontend, "backend", "ask", "once", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := e.hub.Send(ctx, e.frontend, "backend", "ask", "once", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("retry created a new message: %d and %d", first.ID, second.ID)
+	}
+	<-conn.C
+	select {
+	case m := <-conn.C:
+		t.Fatalf("retry was pushed again: %+v", m)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestPeekLeavesMessagesUnread(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := context.Background()
+	m, _ := e.hub.Send(ctx, e.frontend, "backend", "note", "keep me", 0)
+	for i := 0; i < 2; i++ {
+		got, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Peek: true})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("peek %d: %v %+v", i, err, got)
+		}
+	}
+	if err := e.hub.MarkRead(ctx, e.backend, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Peek: true})
+	if len(got) != 0 {
+		t.Fatalf("still unread after confirming: %+v", got)
+	}
+}
+
+func TestKickCutsEverythingOpen(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := context.Background()
+	conn, _ := e.hub.Attach(ctx, e.backend)
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := e.hub.Inbox(ctx, e.backend, InboxOptions{Limit: 10, Wait: 5 * time.Second})
+		waiter <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	sub := e.hub.Subscribe(e.backend.WorkspaceID, e.backend.ID)
+
+	e.hub.Kick(e.backend.WorkspaceID, e.backend.ID)
+
+	select {
+	case <-conn.Closed:
+	case <-time.After(time.Second):
+		t.Fatal("push connection stayed open")
+	}
+	select {
+	case err := <-waiter:
+		if !errors.Is(err, ErrWatcherReplaced) {
+			t.Fatalf("waiter ended with %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("inbox wait stayed open")
+	}
+	select {
+	case <-sub.Closed:
+	case <-time.After(time.Second):
+		t.Fatal("browser subscription stayed open")
 	}
 }

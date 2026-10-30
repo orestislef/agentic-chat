@@ -10,7 +10,10 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,7 +87,9 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/workspaces/{id}/messages", s.withMember(s.handleSendMessage))
 	api.HandleFunc("GET /api/workspaces/{id}/ws", s.withMember(s.handleWorkspaceSocket))
 
+	api.HandleFunc("GET /api/agent/me", s.withAgent(s.handleAgentMe))
 	api.HandleFunc("GET /api/agent/inbox", s.withAgent(s.handleAgentInbox))
+	api.HandleFunc("POST /api/agent/inbox/ack", s.withAgent(s.handleAgentInboxAck))
 	api.HandleFunc("GET /api/agent/ws", s.withAgent(s.handleAgentSocket))
 
 	// Browsers cannot send the agent bearer header cross origin without a preflight
@@ -121,6 +126,8 @@ func (s *Server) Run(ctx context.Context) error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      130 * time.Second, // longer than the longest blocking tool call
 		IdleTimeout:       2 * time.Minute,
+		// Ends waiting calls at shutdown so they can answer "try again" in time.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	go s.maintenance(ctx)
 
@@ -138,14 +145,11 @@ func (s *Server) Run(ctx context.Context) error {
 	return srv.Shutdown(shutdown)
 }
 
-// maintenance prunes old rows once at start and then every hour.
+// maintenance cleans up once at start and then every hour.
 func (s *Server) maintenance(ctx context.Context) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
-		if err := s.store.PruneSessions(ctx); err != nil && ctx.Err() == nil {
-			s.log.Warn("prune sessions", "err", err)
-		}
 		if s.cfg.RetentionDays > 0 {
 			cutoff := time.Now().AddDate(0, 0, -s.cfg.RetentionDays).UnixMilli()
 			n, err := s.store.PruneMessages(ctx, cutoff)
@@ -155,12 +159,48 @@ func (s *Server) maintenance(ctx context.Context) {
 				s.log.Info("pruned old messages", "count", n)
 			}
 		}
+		if err := s.store.Maintain(ctx); err != nil && ctx.Err() == nil {
+			s.log.Warn("database maintenance", "err", err)
+		}
+		if s.cfg.BackupKeep > 0 {
+			if err := s.dailyBackup(ctx); err != nil && ctx.Err() == nil {
+				s.log.Error("daily backup failed", "err", err)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
 	}
+}
+
+// dailyBackup writes one copy per day and removes the oldest beyond the keep count.
+func (s *Server) dailyBackup(ctx context.Context) error {
+	dir := filepath.Join(s.cfg.DataDir, "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "agentic-chat-"+time.Now().UTC().Format("2006-01-02")+".db")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	if err := s.store.Backup(ctx, path); err != nil {
+		return err
+	}
+	s.log.Info("wrote backup", "path", path)
+	existing, err := filepath.Glob(filepath.Join(dir, "agentic-chat-*.db"))
+	if err != nil {
+		return err
+	}
+	sort.Strings(existing) // the date in the name sorts oldest first
+	for len(existing) > s.cfg.BackupKeep {
+		if err := os.Remove(existing[0]); err != nil {
+			return err
+		}
+		existing = existing[1:]
+	}
+	return nil
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +299,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 // internalError logs the cause and tells the client nothing about it.
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, context.Canceled) {
+		writeError(w, http.StatusServiceUnavailable, "try again")
 		return
 	}
 	s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)

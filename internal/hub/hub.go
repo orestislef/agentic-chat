@@ -17,8 +17,8 @@ import (
 
 // Presence states reported for an agent.
 const (
-	StateOnline  = "online"  // holds a live connection
-	StateRecent  = "recent"  // no live connection, but used its tools a moment ago
+	StateOnline  = "online" // holds a live connection
+	StateRecent  = "recent" // no live connection, but used its tools a moment ago
 	StateOffline = "offline"
 )
 
@@ -194,6 +194,17 @@ func (h *Hub) Reply(ctx context.Context, from *store.Agent, messageID int64, bod
 }
 
 func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string, threadID, inReplyTo int64) (*store.Message, error) {
+	// A retry of something already stored skips the checks. It already passed them,
+	// and the thread or rate limit may have filled up in the meantime.
+	if key := idempotencyKey(ctx); key != "" {
+		m, err := h.store.MessageByClientKey(ctx, from.ID, key)
+		if err == nil {
+			return m, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+	}
 	if body == "" {
 		return nil, ErrEmptyBody
 	}
@@ -218,12 +229,27 @@ func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string
 	if !h.allow(from.ID) {
 		return nil, ErrRateLimited
 	}
-	m, err := h.store.InsertMessage(ctx, from.WorkspaceID, threadID, from.ID, to.ID, kind, body, inReplyTo)
+	m, created, err := h.store.InsertMessageKeyed(ctx, from.WorkspaceID, threadID, from.ID, to.ID, kind, body, inReplyTo, idempotencyKey(ctx))
 	if err != nil {
 		return nil, err
 	}
-	h.dispatch(ctx, m)
+	if created {
+		h.dispatch(ctx, m)
+	}
 	return m, nil
+}
+
+type idempotencyKeyType struct{}
+
+// WithIdempotencyKey marks the sends in ctx as retries of one logical send, so a
+// client that never saw the answer can safely try again.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, idempotencyKeyType{}, key)
+}
+
+func idempotencyKey(ctx context.Context) string {
+	key, _ := ctx.Value(idempotencyKeyType{}).(string)
+	return key
 }
 
 func (h *Hub) allow(agentID int64) bool {
@@ -341,6 +367,25 @@ func (h *Hub) Attach(ctx context.Context, a *store.Agent) (*Conn, error) {
 	return c, nil
 }
 
+// Redeliver pushes what is still unacknowledged on a live connection. It covers a
+// backlog larger than Attach sends at once and an ack lost on the way. Clients drop
+// messages they already have, so pushing one twice is harmless.
+func (h *Hub) Redeliver(ctx context.Context, a *store.Agent, c *Conn) error {
+	pending, err := h.store.Undelivered(ctx, a.ID, pushBuffer/2)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.conns[a.ID] != c {
+		return nil
+	}
+	for _, m := range pending {
+		h.pushLocked(c, m)
+	}
+	return nil
+}
+
 // Detach removes a connection when its socket ends.
 func (h *Hub) Detach(a *store.Agent, c *Conn) {
 	h.mu.Lock()
@@ -354,14 +399,30 @@ func (h *Hub) Detach(a *store.Agent, c *Conn) {
 	}
 }
 
-// Kick ends the live connection of a revoked agent or one whose token changed.
+// Kick cuts everything a participant has open: the push connection, waiting inbox
+// calls and, for a person, browser tabs still watching the workspace. Access has to
+// end when it is taken away, not whenever the socket happens to close.
 func (h *Hub) Kick(workspaceID, agentID int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if c := h.conns[agentID]; c != nil {
 		h.closeConnLocked(c, ReasonRevoked)
-		h.publishPresenceLocked(workspaceID, agentID, StateOffline)
 	}
+	for w := range h.inboxWaiters[agentID] {
+		close(w.cancel)
+		delete(h.inboxWaiters[agentID], w)
+	}
+	for sub := range h.subs[workspaceID] {
+		if sub.HumanID != agentID {
+			continue
+		}
+		select {
+		case <-sub.Closed:
+		default:
+			close(sub.Closed)
+		}
+	}
+	h.publishPresenceLocked(workspaceID, agentID, StateOffline)
 }
 
 // Ack records that the client received a pushed message.
@@ -460,10 +521,27 @@ func (h *Hub) WaitReply(ctx context.Context, a *store.Agent, messageID int64, wa
 	}
 }
 
-// Inbox returns unread messages and marks them read. With a wait it blocks until
-// at least one arrives. An exclusive wait replaces any earlier exclusive wait of
-// the same agent, which keeps stale background watchers from swallowing messages.
-func (h *Hub) Inbox(ctx context.Context, a *store.Agent, limit int, wait time.Duration, exclusive bool) ([]store.Message, error) {
+// InboxOptions controls an inbox query.
+type InboxOptions struct {
+	Limit int
+	Wait  time.Duration
+	// Exclusive replaces any earlier exclusive wait of the same agent, which keeps
+	// stale background watchers from swallowing messages.
+	Exclusive bool
+	// Peek leaves the messages unread. The caller confirms with MarkRead once it
+	// has them, so a response lost on the way does not lose the messages.
+	Peek bool
+}
+
+// MarkRead confirms messages an earlier Peek returned.
+func (h *Hub) MarkRead(ctx context.Context, a *store.Agent, ids ...int64) error {
+	return h.store.MarkRead(ctx, a.ID, ids...)
+}
+
+// Inbox returns unread messages, by default marking them read. With a wait it
+// blocks until at least one arrives.
+func (h *Hub) Inbox(ctx context.Context, a *store.Agent, opts InboxOptions) ([]store.Message, error) {
+	limit, wait, exclusive := opts.Limit, opts.Wait, opts.Exclusive
 	w := &inboxWaiter{wake: make(chan struct{}, 1), cancel: make(chan struct{}), exclusive: exclusive}
 	if wait > 0 {
 		h.mu.Lock()
@@ -501,6 +579,9 @@ func (h *Hub) Inbox(ctx context.Context, a *store.Agent, limit int, wait time.Du
 		messages, err := h.store.Unread(ctx, a.ID, limit)
 		if err != nil {
 			return nil, err
+		}
+		if len(messages) > 0 && opts.Peek {
+			return messages, nil
 		}
 		if len(messages) > 0 {
 			ids := make([]int64, len(messages))
