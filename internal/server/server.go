@@ -22,6 +22,7 @@ import (
 	"github.com/orestislef/agentic-chat/internal/auth"
 	"github.com/orestislef/agentic-chat/internal/hub"
 	"github.com/orestislef/agentic-chat/internal/mcp"
+	"github.com/orestislef/agentic-chat/internal/mcpserver"
 	"github.com/orestislef/agentic-chat/internal/store"
 	"github.com/orestislef/agentic-chat/web"
 )
@@ -40,6 +41,7 @@ type Server struct {
 	log     *slog.Logger
 	limits  *attemptLimiter
 	signups *attemptLimiter
+	conns   *connLimiter
 }
 
 // New creates a server.
@@ -51,6 +53,7 @@ func New(cfg Config, s *store.Store, log *slog.Logger) *Server {
 		log:     log,
 		limits:  newAttemptLimiter(10, 15*time.Minute),
 		signups: newAttemptLimiter(demoSignupsPerIP, 24*time.Hour),
+		conns:   newConnLimiter(cfg.MaxConnections),
 	}
 	if cfg.Demo {
 		s.SetDemo(true)
@@ -64,7 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.Handle("/mcp", mcp.NewHandler(s.store, s.hub, s.log))
+	mux.Handle("/mcp", s.limited(mcpserver.NewHandler(s.store, s.hub, s.log).ServeHTTP))
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/config", s.handleConfig)
@@ -92,12 +95,12 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/workspaces/{id}/threads", s.withMember(s.handleListThreads))
 	api.HandleFunc("GET /api/workspaces/{id}/messages", s.withMember(s.handleListMessages))
 	api.HandleFunc("POST /api/workspaces/{id}/messages", s.withMember(s.handleSendMessage))
-	api.HandleFunc("GET /api/workspaces/{id}/ws", s.withMember(s.handleWorkspaceSocket))
+	api.HandleFunc("GET /api/workspaces/{id}/ws", s.limited(s.withMember(s.handleWorkspaceSocket)))
 
 	api.HandleFunc("GET /api/agent/me", s.withAgent(s.handleAgentMe))
-	api.HandleFunc("GET /api/agent/inbox", s.withAgent(s.handleAgentInbox))
+	api.HandleFunc("GET /api/agent/inbox", s.limited(s.withAgent(s.handleAgentInbox)))
 	api.HandleFunc("POST /api/agent/inbox/ack", s.withAgent(s.handleAgentInboxAck))
-	api.HandleFunc("GET /api/agent/ws", s.withAgent(s.handleAgentSocket))
+	api.HandleFunc("GET /api/agent/ws", s.limited(s.withAgent(s.handleAgentSocket)))
 
 	// Browsers cannot send the agent bearer header cross origin without a preflight
 	// we never allow, so this only has to protect the cookie based routes.
@@ -106,7 +109,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /install.sh", s.handleInstallShell)
 	mux.HandleFunc("GET /install.ps1", s.handleInstallPowerShell)
 	mux.HandleFunc("GET /downloads/{file}", s.handleDownload)
-	mux.Handle("/", http.FileServerFS(web.FS))
+	mux.Handle("/", newStaticHandler(web.FS))
 
 	return securityHeaders(mux)
 }

@@ -27,7 +27,9 @@ type Config struct {
 	BackupKeep    int
 	TrustProxy    bool
 	Demo          bool
-	Limits        hub.Limits
+	// MaxConnections caps long lived requests, zero means no cap.
+	MaxConnections int
+	Limits         hub.Limits
 }
 
 // DatabasePath is where the SQLite file lives.
@@ -57,6 +59,7 @@ func ConfigFromEnv() (Config, error) {
 	}{
 		{"AC_RETENTION_DAYS", &c.RetentionDays, 0},
 		{"AC_BACKUP_KEEP", &c.BackupKeep, 0},
+		{"AC_MAX_CONNECTIONS", &c.MaxConnections, 0},
 		{"AC_MAX_THREAD_MESSAGES", &c.Limits.MaxThreadMessages, 2},
 		{"AC_MAX_MESSAGE_BYTES", &c.Limits.MaxMessageBytes, 1},
 		{"AC_MESSAGES_PER_MINUTE", &c.Limits.MessagesPerMinute, 1},

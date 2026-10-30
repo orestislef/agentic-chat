@@ -15,7 +15,10 @@ import (
 // Revisions this server speaks, newest first. Revision 2026-07-28 is left out on
 // purpose: it has no way to deliver the push notifications the bridge relies on,
 // and clients fall back to an earlier handshake when a server does not offer it.
-var supportedVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
+var supportedVersions = []string{LatestVersion, "2025-06-18", "2025-03-26", "2024-11-05"}
+
+// LatestVersion is the newest revision this server offers.
+const LatestVersion = "2025-11-25"
 
 // JSON-RPC error codes.
 const (

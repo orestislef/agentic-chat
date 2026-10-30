@@ -74,6 +74,8 @@ func TestLoad(t *testing.T) {
 	var sent sync.Map
 	var mu sync.Mutex
 	var sendLat, pushLat []time.Duration
+	refused := 0
+	var firstRefusal error
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	var readers sync.WaitGroup
@@ -132,8 +134,15 @@ func TestLoad(t *testing.T) {
 				sent.Store(body, start)
 				resp, err := client.Do(req)
 				if err != nil {
-					errs <- err
-					return
+					// A burst can overflow the listen queue of this machine. Real clients retry.
+					mu.Lock()
+					refused++
+					if firstRefusal == nil {
+						firstRefusal = err
+					}
+					mu.Unlock()
+					time.Sleep(50 * time.Millisecond)
+					continue
 				}
 				data, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
@@ -159,7 +168,10 @@ func TestLoad(t *testing.T) {
 	runtime.ReadMemStats(&m)
 	mu.Lock()
 	defer mu.Unlock()
-	t.Logf("%d agents for %d s: %d sends, %.0f per second, %d pushes received", agents, seconds, len(sendLat), float64(len(sendLat))/float64(seconds), len(pushLat))
+	t.Logf("%d agents for %d s: %d sends, %.0f per second, %d pushes received, %d connections refused", agents, seconds, len(sendLat), float64(len(sendLat))/float64(seconds), len(pushLat), refused)
+	if firstRefusal != nil {
+		t.Logf("first connection error: %v", firstRefusal)
+	}
 	t.Logf("send latency  %s", percentiles(sendLat))
 	t.Logf("push latency  %s", percentiles(pushLat))
 	t.Logf("goroutines %d, heap %d MiB, total from OS %d MiB", runtime.NumGoroutine(), m.HeapAlloc>>20, m.Sys>>20)

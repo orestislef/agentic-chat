@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -719,4 +720,135 @@ func TestDemoOffChangesNothing(t *testing.T) {
 		u.createAgent(ws, "agent"+strconv.Itoa(i))
 	}
 	u.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "another"}, http.StatusCreated, nil)
+}
+
+func TestConnectionCapRefusesThenRecovers(t *testing.T) {
+	ts := start(t, func(c *Config) { c.MaxConnections = 2 })
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	_, a := owner.createAgent(ws, "a")
+	_, b := owner.createAgent(ws, "b")
+	_, c := owner.createAgent(ws, "c")
+
+	first := dialAgent(t, ts, a)
+	dialAgent(t, ts, b)
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + c}},
+	})
+	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("third connection: %v %+v", err, resp)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("refusal does not say when to retry")
+	}
+	// The web UI and health checks are not long lived and stay reachable.
+	if status, _ := owner.do(http.MethodGet, "/api/workspaces/"+ws+"/agents", nil); status != http.StatusOK {
+		t.Fatalf("normal api call refused: %d", status)
+	}
+	first.CloseNow()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + c}},
+		})
+		if err == nil {
+			conn.CloseNow()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("slot never came free")
+}
+
+func TestConnLimiterPerAddressAndOff(t *testing.T) {
+	l := newConnLimiter(100)
+	for i := 0; i < l.perIP; i++ {
+		if !l.acquire("1.1.1.1") {
+			t.Fatal("refused below the per address limit")
+		}
+	}
+	if l.acquire("1.1.1.1") {
+		t.Fatal("one address went over its share")
+	}
+	if !l.acquire("2.2.2.2") {
+		t.Fatal("another address was refused")
+	}
+	l.release("1.1.1.1")
+	if !l.acquire("1.1.1.1") {
+		t.Fatal("released slot not usable")
+	}
+	off := newConnLimiter(0)
+	for i := 0; i < 1000; i++ {
+		if !off.acquire("1.1.1.1") {
+			t.Fatal("zero should mean no limit")
+		}
+	}
+}
+
+func TestStaticFilesCompressedAndRevalidated(t *testing.T) {
+	ts := start(t)
+	// Go's client only hides compression when it asked for it itself.
+	req, _ := http.NewRequest(http.MethodGet, ts.url+"/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("not compressed: %v", resp.Header)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, _ := io.ReadAll(gz)
+	if !bytes.Contains(plain, []byte("renderAuth")) || len(body) >= len(plain) {
+		t.Fatalf("%d bytes on the wire, %d plain", len(body), len(plain))
+	}
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/javascript") {
+		t.Fatalf("content type %q, a browser refuses modules without the right one", resp.Header.Get("Content-Type"))
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("no etag")
+	}
+
+	again, _ := http.NewRequest(http.MethodGet, ts.url+"/app.js", nil)
+	again.Header.Set("If-None-Match", etag)
+	resp, err = http.DefaultClient.Do(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	for path, want := range map[string]int{"/": 200, "/index.html": 200, "/style.css": 200, "/nope.js": 404, "/../internal/server/server.go": 404} {
+		req, _ := http.NewRequest(http.MethodGet, ts.url+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("%s: status %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+	resp, _ = http.Post(ts.url+"/", "text/plain", strings.NewReader("x"))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("post: %d", resp.StatusCode)
+	}
+	font, _ := http.Get(ts.url + "/fonts/schibsted-grotesk-latin-wght-normal.woff2")
+	font.Body.Close()
+	if font.StatusCode != 200 || !strings.Contains(font.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("font: %d %v", font.StatusCode, font.Header)
+	}
 }

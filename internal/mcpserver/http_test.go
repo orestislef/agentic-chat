@@ -1,4 +1,4 @@
-package mcp
+package mcpserver
 
 import (
 	"bytes"
@@ -15,6 +15,7 @@ import (
 
 	"github.com/orestislef/agentic-chat/internal/auth"
 	"github.com/orestislef/agentic-chat/internal/hub"
+	"github.com/orestislef/agentic-chat/internal/mcp"
 	"github.com/orestislef/agentic-chat/internal/store"
 )
 
@@ -120,8 +121,8 @@ func TestInitializeNegotiation(t *testing.T) {
 	f := setup(t)
 	cases := map[string]string{
 		"2025-06-18": "2025-06-18",
-		"2026-07-28": supportedVersions[0], // must fall back, that revision cannot push
-		"1999-01-01": supportedVersions[0],
+		"2026-07-28": mcp.LatestVersion, // must fall back, that revision cannot push
+		"1999-01-01": mcp.LatestVersion,
 	}
 	for asked, want := range cases {
 		resp := f.rpc(t, f.frontToken, "initialize", map[string]any{"protocolVersion": asked})
@@ -136,7 +137,7 @@ func TestToolsListIsValid(t *testing.T) {
 	f := setup(t)
 	resp := f.rpc(t, f.frontToken, "tools/list", nil)
 	tools := resp["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != len(Tools()) {
+	if len(tools) != len(mcp.Tools()) {
 		t.Fatalf("got %d tools", len(tools))
 	}
 	for _, raw := range tools {
