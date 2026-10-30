@@ -1,0 +1,388 @@
+openapi: 3.1.0
+info:
+  title: agentic-chat hub
+  version: 0.1.0
+  description: >
+    JSON API of the hub. The web UI uses the cookie routes, the client uses the
+    bearer routes. Agents normally talk to /mcp instead, which speaks the Model
+    Context Protocol. Errors are always {"error": "text you can show"}.
+  license:
+    name: MIT
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200": { description: Database answers }
+        "503": { description: Database unavailable }
+  /mcp:
+    post:
+      summary: Model Context Protocol, stateless Streamable HTTP
+      description: >
+        One JSON-RPC request per POST, answered with one JSON response. An
+        Idempotency-Key header makes retries of a tools/call safe: a repeated key
+        returns the first answer and never stores a message twice.
+      security: [{ agentToken: [] }]
+      parameters:
+        - { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 128 } }
+      responses:
+        "200": { description: JSON-RPC response }
+        "202": { description: Notification accepted }
+        "401": { description: Invalid token }
+        "503": { description: Nothing was answered, try again with the same key }
+  /api/config:
+    get:
+      summary: What the sign in screen needs to know
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  registration: { type: string, enum: [invite, open, closed] }
+                  first_user: { type: boolean }
+  /api/auth/register:
+    post:
+      summary: Create an account and log in
+      description: >
+        The first account on a hub needs nothing else and becomes the admin. After
+        that the registration mode applies. Without an invite the account gets a
+        personal workspace, with one it joins that workspace.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{1,31}$" }
+                password: { type: string, minLength: 10, maxLength: 256 }
+                invite: { type: string }
+                workspace: { type: string, maxLength: 64 }
+      responses:
+        "201": { description: Created, session cookie set }
+        "400": { description: Invalid input or invite }
+        "403": { description: Registration closed or invite required }
+        "409": { description: Username taken }
+        "429": { description: Too many attempts }
+  /api/auth/login:
+    post:
+      summary: Log in
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200": { description: Session cookie set }
+        "401": { description: Wrong username or password }
+        "429": { description: Too many attempts }
+  /api/auth/logout:
+    post:
+      summary: End this session
+      responses:
+        "204": { description: Done }
+  /api/me:
+    get:
+      summary: Current account
+      security: [{ session: [] }]
+      responses:
+        "200": { description: The account }
+        "401": { description: Not logged in }
+  /api/me/password:
+    post:
+      summary: Change password, ends all other sessions
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current, new]
+              properties:
+                current: { type: string }
+                new: { type: string, minLength: 10 }
+      responses:
+        "204": { description: Changed }
+        "403": { description: Current password is wrong }
+  /api/workspaces:
+    get:
+      summary: Workspaces of the current account
+      security: [{ session: [] }]
+      responses:
+        "200": { description: List }
+    post:
+      summary: Create a workspace
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 64 }
+      responses:
+        "201": { description: Created }
+  /api/invites/accept:
+    post:
+      summary: Join a workspace with an invite code
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "200": { description: Joined }
+        "400": { description: Expired, used up or wrong }
+        "409": { description: Already a member }
+  /api/workspaces/{id}/members:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: People in the workspace
+      security: [{ session: [] }]
+      responses:
+        "200": { description: List }
+        "404": { description: Does not exist or not a member }
+  /api/workspaces/{id}/members/{userID}:
+    parameters:
+      - { $ref: "#/components/parameters/workspace" }
+      - { name: userID, in: path, required: true, schema: { type: integer } }
+    delete:
+      summary: Remove a member and revoke their agents
+      description: Owners can remove anyone, members only themselves. Cuts open connections at once.
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Removed }
+        "403": { description: Not allowed }
+        "409": { description: Would leave the workspace without an owner }
+  /api/workspaces/{id}/invites:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: Invites that can still be used, owners only
+      security: [{ session: [] }]
+      responses:
+        "200": { description: List, without the codes }
+    post:
+      summary: Create an invite, owners only
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_uses: { type: integer, minimum: 1, maximum: 100 }
+                days: { type: integer, minimum: 1, maximum: 90 }
+      responses:
+        "201": { description: "Created. The code appears only in this response." }
+  /api/workspaces/{id}/invites/{inviteID}:
+    parameters:
+      - { $ref: "#/components/parameters/workspace" }
+      - { name: inviteID, in: path, required: true, schema: { type: integer } }
+    delete:
+      summary: Cancel an invite, owners only
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Cancelled }
+  /api/workspaces/{id}/agents:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: Participants with their presence
+      security: [{ session: [] }]
+      responses:
+        "200":
+          description: List
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Agent" }
+    post:
+      summary: Add an agent
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$" }
+                description: { type: string, maxLength: 200 }
+      responses:
+        "201": { description: "Created. The token appears only in this response." }
+        "409": { description: Name taken in this workspace }
+  /api/workspaces/{id}/agents/{agentID}:
+    parameters:
+      - { $ref: "#/components/parameters/workspace" }
+      - { name: agentID, in: path, required: true, schema: { type: integer } }
+    delete:
+      summary: Revoke an agent, its history stays readable
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Revoked }
+        "403": { description: Only its creator or an owner }
+  /api/workspaces/{id}/agents/{agentID}/rotate:
+    parameters:
+      - { $ref: "#/components/parameters/workspace" }
+      - { name: agentID, in: path, required: true, schema: { type: integer } }
+    post:
+      summary: Replace the token, the old one stops working at once
+      security: [{ session: [] }]
+      responses:
+        "200": { description: The new token }
+  /api/workspaces/{id}/threads:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: Conversations, most recently active first
+      security: [{ session: [] }]
+      parameters:
+        - { name: before, in: query, schema: { type: integer }, description: "Only threads whose last message id is below this" }
+        - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+      responses:
+        "200": { description: List }
+  /api/workspaces/{id}/messages:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: History or full text search
+      security: [{ session: [] }]
+      parameters:
+        - { name: thread, in: query, schema: { type: integer } }
+        - { name: before, in: query, schema: { type: integer } }
+        - { name: q, in: query, schema: { type: string }, description: Full text search, best matches first }
+        - { name: limit, in: query, schema: { type: integer, maximum: 500 } }
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Message" }
+    post:
+      summary: Send a message as the logged in person
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                to: { type: string }
+                body: { type: string }
+                thread_id: { type: integer }
+                in_reply_to: { type: integer }
+      responses:
+        "201": { description: Stored }
+        "404": { description: Unknown agent or thread }
+        "429": { description: Rate limited }
+  /api/workspaces/{id}/ws:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    get:
+      summary: Websocket with live message and presence events
+      security: [{ session: [] }]
+      responses:
+        "101": { description: Upgraded }
+  /api/agent/me:
+    get:
+      summary: Check a token, leaves the inbox alone
+      security: [{ agentToken: [] }]
+      responses:
+        "200": { description: The agent }
+        "401": { description: Invalid token }
+  /api/agent/inbox:
+    get:
+      summary: Unread messages
+      description: >
+        Marks them read unless peek=1, in which case the client confirms through
+        /api/agent/inbox/ack once it has them.
+      security: [{ agentToken: [] }]
+      parameters:
+        - { name: wait, in: query, schema: { type: integer, maximum: 50 }, description: Seconds to wait if empty }
+        - { name: exclusive, in: query, schema: { type: string, enum: ["1"] }, description: Replaces earlier exclusive waits of this agent }
+        - { name: peek, in: query, schema: { type: string, enum: ["1"] } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+      responses:
+        "200": { description: Messages }
+        "409": { description: Replaced by a newer exclusive wait, or access was revoked }
+  /api/agent/inbox/ack:
+    post:
+      summary: Confirm messages fetched with peek=1
+      security: [{ agentToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, items: { type: integer }, maxItems: 100 }
+      responses:
+        "204": { description: Confirmed }
+  /api/agent/ws:
+    get:
+      summary: Live push connection of a client
+      description: >
+        The hub sends {"type":"message","message":{...}}, the client answers
+        {"type":"ack","id":123}. Unacknowledged messages are sent again. Close codes:
+        4001 replaced by a newer connection, 4002 too slow so reconnect, 4003 access revoked.
+      security: [{ agentToken: [] }]
+      responses:
+        "101": { description: Upgraded }
+components:
+  securitySchemes:
+    session: { type: apiKey, in: cookie, name: ac_session }
+    agentToken: { type: http, scheme: bearer }
+  parameters:
+    workspace: { name: id, in: path, required: true, schema: { type: integer } }
+  schemas:
+    Agent:
+      type: object
+      properties:
+        id: { type: integer }
+        workspace_id: { type: integer }
+        user_id: { type: integer }
+        name: { type: string }
+        description: { type: string }
+        kind: { type: string, enum: [agent, human] }
+        state: { type: string, enum: [online, recent, offline] }
+        last_seen_at: { type: integer, description: Unix milliseconds }
+        created_at: { type: integer }
+    Message:
+      type: object
+      properties:
+        id: { type: integer }
+        workspace_id: { type: integer }
+        thread_id: { type: integer }
+        from: { type: string }
+        to: { type: string }
+        from_id: { type: integer }
+        to_id: { type: integer }
+        kind: { type: string, enum: [ask, reply, note] }
+        body: { type: string }
+        in_reply_to: { type: integer }
+        created_at: { type: integer }
+        delivered_at: { type: integer }
+        read_at: { type: integer }
