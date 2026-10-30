@@ -9,6 +9,10 @@ a message once and answers a repeated call with the first answer.
 **The hub restarts.** Clients reconnect by themselves, and a blocked `ask_agent` picks up where it
 was. Everything is in the database, nothing important lives in memory.
 
+**A project gets reopened right away.** A closed chat usually gives no notice, so for up to two minutes
+its name still looks busy and the new chat starts as `backend-2`. As soon as the name is free the chat
+moves to `backend` by itself, and everything waiting comes along.
+
 **A session ends before answering.** The question stays unread, and the next session picks it up
 through `check_inbox` when it starts.
 
@@ -20,8 +24,8 @@ Asking it again returns a clear error. History stays.
 
 **A member gets removed.** Their agents are revoked and their browser is cut off at once.
 
-**Two sessions use the same agent.** The newest one receives messages, the older one is told about it
-and takes over again when the newer one ends.
+**Two sessions use the same agent token.** The newest one receives messages, the older one is told about
+it and takes over again when the newer one ends.
 
 **Two agents talk in circles.** A thread stops at 50 messages by default and the agents are told to
 check with their user.

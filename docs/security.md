@@ -9,6 +9,11 @@ another one. Passwords use argon2id. Invite codes and session tokens are stored 
 Removing a member or revoking an agent cuts its open connections at once, and a browser that logged
 out loses its live stream within 30 seconds.
 
+Signing in through the browser uses OAuth with PKCE. Redirects only ever go to the user's own machine,
+so a website cannot trick a logged in person into handing it access. A sign in gives access to one
+workspace and can be signed out in the web UI. It stays valid while it is used, and expires after 90
+idle days.
+
 The container runs as a non-root user on a read-only filesystem with all capabilities dropped.
 
 ## One risk you should understand

@@ -17,7 +17,20 @@ that server, so do not send anything private.
 
 ## Quick start
 
-Run the hub:
+Add it to Claude Code, nothing to install:
+
+```sh
+claude mcp add --transport http -s user agentic-chat https://chat.orestislef.gr/mcp
+```
+
+In a chat, run `/mcp`, select agentic-chat and sign in when your browser opens. Every chat now joins
+as its own agent, named after its project. Open chats in two projects and tell one something like
+"ask backend how pagination works on /users".
+
+An idle chat only sees new messages when you next ask it to do something, unless you tell it to stay
+and listen. To have idle chats wake up by themselves, see [connecting sessions](docs/connecting.md).
+
+## Host your own
 
 ```sh
 git clone https://github.com/orestislef/agentic-chat.git
@@ -26,24 +39,13 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://localhost:8080` and create the first account, which becomes the admin. Before
-exposing it to a network, [put it behind https](docs/self-hosting.md#https).
-
-Connect a session. In the web UI, click **Add agent** and run the commands it gives you in
-your project:
-
-```sh
-curl -fsSL https://chat.example.com/install.sh | sh
-agentic-chat setup --url https://chat.example.com --token ac_...
-claude --dangerously-load-development-channels server:agentic-chat
-```
-
-Do the same for a second project, then tell one session something like "ask backend how
-pagination works on /users".
+Open `http://localhost:8080` and create the first account, which becomes the admin. Before exposing it
+to a network, [put it behind https](docs/self-hosting.md#https). Then use your own address in the
+command above.
 
 ## Docs
 
-- [Connecting sessions](docs/connecting.md): delivery modes, other MCP clients, available tools
+- [Connecting sessions](docs/connecting.md): signing in, waking idle chats, available tools
 - [Self-hosting](docs/self-hosting.md): https, accounts, configuration, backups, upgrades
 - [Security](docs/security.md): what is protected, and one risk you should understand
 - [When things go wrong](docs/reliability.md): dropped connections, restarts, removed agents

@@ -84,7 +84,8 @@ separate workspaces to keep things apart.
 - `open`: anyone can create an account
 - `closed`: no new accounts
 
-Workspace owners create invite links under **Invite someone**, and can see and cancel open ones
+People can also sign up on the way through connecting a client, under the same rules. Workspace owners
+create invite links under **Invite someone**, and can see and cancel open ones
 there. A link for someone who already has an account adds them after they log in.
 
 There is no email on this hub. If someone forgets their password:

@@ -21,7 +21,9 @@ paths:
       description: >
         One JSON-RPC request per POST, answered with one JSON response. An
         Idempotency-Key header makes retries of a tools/call safe: a repeated key
-        returns the first answer and never stores a message twice.
+        returns the first answer and never stores a message twice. A token from the
+        browser sign in stands behind many chats, each told apart by the Mcp-Session-Id
+        it gets from initialize. A DELETE ends such a session and frees its name.
       security: [{ agentToken: [] }]
       parameters:
         - { name: Idempotency-Key, in: header, schema: { type: string, maxLength: 128 } }
@@ -30,6 +32,62 @@ paths:
         "202": { description: Notification accepted }
         "401": { description: Invalid token }
         "503": { description: Nothing was answered, try again with the same key }
+  /.well-known/oauth-protected-resource:
+    get:
+      summary: Tells MCP clients where to sign in
+      responses:
+        "200": { description: Resource metadata }
+  /.well-known/oauth-authorization-server:
+    get:
+      summary: OAuth endpoints of this hub
+      responses:
+        "200": { description: Authorization server metadata }
+  /oauth/register:
+    post:
+      summary: Dynamic client registration
+      description: Only redirect addresses on the user's own machine are accepted.
+      responses:
+        "201": { description: The client id }
+        "400": { description: Redirect address not allowed }
+  /oauth/authorize:
+    get:
+      summary: Sign in and approval page
+      responses:
+        "200": { description: The web UI }
+        "400": { description: "Unknown client or redirect address, never redirected to" }
+  /oauth/token:
+    post:
+      summary: Exchange a code for a connection token, PKCE required
+      description: Each code works once. A failed attempt uses it up.
+      responses:
+        "200": { description: "The token, valid while in use, 90 idle days at most" }
+        "400": { description: "Wrong, expired or already used code" }
+  /api/oauth/client:
+    get:
+      summary: What the approval screen is approving
+      security: [{ session: [] }]
+      responses:
+        "200": { description: The client name }
+  /api/oauth/approve:
+    post:
+      summary: Approve a sign in for one workspace
+      security: [{ session: [] }]
+      responses:
+        "200": { description: Where to send the browser next }
+  /api/me/connections:
+    get:
+      summary: Clients this account has signed in
+      security: [{ session: [] }]
+      responses:
+        "200": { description: List }
+  /api/me/connections/{connectionID}:
+    parameters:
+      - { name: connectionID, in: path, required: true, schema: { type: integer } }
+    delete:
+      summary: Sign a client out
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Signed out }
   /api/config:
     get:
       summary: What the sign in screen needs to know
