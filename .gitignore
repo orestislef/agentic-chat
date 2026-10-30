@@ -1,0 +1,17 @@
+# build output
+/bin/
+/dist/
+*.exe
+
+# local data and secrets
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.mcp.json
+
+# editors and os
+.idea/
+.vscode/
+.DS_Store
