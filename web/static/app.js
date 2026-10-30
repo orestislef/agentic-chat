@@ -410,6 +410,7 @@ function sequence(messages) {
         renderBody(m.body)),
       h("div", { class: "arrow", "aria-hidden": "true" }));
     step.style.gridColumn = `${Math.min(from, to)} / ${Math.max(from, to) + 1}`;
+    step.style.setProperty("--span", String(Math.abs(to - from) + 1));
     step.style.gridRow = String(i + 2);
     grid.append(step);
   });

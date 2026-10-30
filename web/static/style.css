@@ -94,9 +94,9 @@ label input, label select, label textarea { margin-top: 0.25rem; }
   background: var(--panel);
 }
 .auth-story { padding: 3.5rem clamp(1.5rem, 6vw, 5rem); color: var(--panel-text); align-self: center; }
-.auth-story h1 { font-size: var(--step-3); line-height: 1.1; font-weight: 600; max-width: 16ch; }
+.auth-story h1 { font-size: clamp(var(--step-3), 4vw, 3.25rem); line-height: 1.08; font-weight: 600; max-width: 16ch; }
 .auth-story p { margin-top: 1rem; max-width: 42ch; color: var(--panel-dim); }
-.auth-demo { margin-top: 2.5rem; max-width: 26rem; display: block; width: 100%; }
+.auth-demo { margin-top: 2.5rem; max-width: 34rem; display: block; width: 100%; }
 .auth-demo text { fill: var(--panel-text); font-size: 13px; }
 .auth-demo .life { stroke: var(--panel-line); stroke-width: 1.5; }
 .auth-demo .call { stroke: var(--lamp); stroke-width: 2; fill: none; }
@@ -183,7 +183,7 @@ label input, label select, label textarea { margin-top: 0.25rem; }
 .sheet { display: flex; flex-direction: column; min-height: 0; background: var(--sheet); position: relative; }
 .banner { background: var(--lamp); padding: 0.25rem 1rem; font-size: var(--step--1); font-weight: 500; }
 .seq-scroll { flex: 1; overflow-y: auto; }
-.seq { display: grid; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); position: relative; padding-bottom: 1.5rem; min-height: 100%; }
+.seq { display: grid; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); position: relative; min-height: 100%; }
 .seq-head {
   position: sticky; top: 0; z-index: 2;
   background: var(--sheet); border-bottom: 1px solid var(--rule);
@@ -199,11 +199,13 @@ label input, label select, label textarea { margin-top: 0.25rem; }
   background: var(--rule);
   pointer-events: none;
 }
-.step { padding: 0.75rem 0.625rem 0; min-width: 0; display: flex; flex-direction: column; z-index: 1; }
+.step { padding-top: 0.75rem; min-width: 0; display: flex; flex-direction: column; z-index: 1; }
+.step:last-child { padding-bottom: 1.5rem; }
 .step.rightward { align-items: flex-start; }
 .step.leftward { align-items: flex-end; }
 .bubble {
-  max-width: min(100%, 44rem);
+  max-width: min(calc(100% - 1.25rem), 44rem);
+  margin-inline: 0.625rem;
   background: #fff;
   border: 1px solid var(--rule);
   border-radius: 6px;
@@ -221,7 +223,11 @@ label input, label select, label textarea { margin-top: 0.25rem; }
 .answer { margin-top: 0.375rem; }
 
 /* The arrow under each message: solid asks, dashed answers, dotted notes. */
-.arrow { align-self: stretch; height: 0.625rem; margin-top: 0.3125rem; position: relative; color: var(--line); }
+/* Runs from lifeline to lifeline, which sit in the middle of the first and last column. */
+.arrow {
+  align-self: stretch; height: 0.625rem; margin-top: 0.3125rem; position: relative; color: var(--line);
+  margin-inline: calc(100% / var(--span) / 2);
+}
 .step.person .arrow { color: var(--person); }
 .arrow::before {
   content: ""; position: absolute; left: 0; right: 0; top: 50%;
