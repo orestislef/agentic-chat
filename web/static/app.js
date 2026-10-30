@@ -132,10 +132,10 @@ function renderAuth() {
         try {
           if (isRegister) {
             await api("POST", "/api/auth/register", { username: username.value, password: password.value, invite: inviteInput.value });
+            clearInviteFromURL(); // registering used the code already
           } else {
             await api("POST", "/api/auth/login", { username: username.value, password: password.value });
           }
-          clearInviteFromURL();
           await start();
         } catch (err) {
           error.textContent = err.message;
@@ -516,16 +516,55 @@ function connectSocket() {
     if (wasDown) await reloadWorkspace().catch(() => {});
   };
   socket.onmessage = (event) => handleEvent(JSON.parse(event.data));
-  socket.onclose = () => {
+  socket.onclose = async () => {
     state.connected = false;
     drawSheet();
+    if (await lostAccess()) return;
     const delay = Math.min(30000, 1000 * 2 ** state.socketRetry) + Math.random() * 500;
     state.socketRetry++;
     state.socketTimer = setTimeout(connectSocket, delay);
   };
 }
 
+// A closed socket can mean this person was removed from the workspace. Reconnecting
+// would then fail forever, so say what happened and move on to what is left.
+async function lostAccess() {
+  let list;
+  try {
+    list = await api("GET", "/api/workspaces");
+  } catch {
+    return !state.me; // logged out shows the sign in screen, anything else is a network problem
+  }
+  state.workspaces = list;
+  if (list.some((w) => w.id === state.workspaceId)) return false;
+  alertDialog("You no longer have access", "You were removed from that workspace.");
+  state.workspaceId = list[0]?.id || null;
+  state.agents = [];
+  state.threads = [];
+  state.threadId = null;
+  state.messages = [];
+  state.connected = true;
+  if (state.workspaceId) await openWorkspace(state.workspaceId);
+  else {
+    drawRail();
+    drawThreads();
+    drawSheet();
+  }
+  return true;
+}
+
+async function reloadAgents() {
+  state.agents = await api("GET", `/api/workspaces/${state.workspaceId}/agents`);
+  drawRail();
+  if (state.threadId) refreshHeads();
+  else if (!state.messages.length) drawSheet();
+}
+
 function handleEvent(event) {
+  if (event.type === "agents") {
+    reloadAgents().catch(() => {});
+    return;
+  }
   if (event.type === "presence") {
     const agent = state.agents.find((a) => a.id === event.agent_id);
     if (agent) {
@@ -718,6 +757,24 @@ async function peopleDialog() {
   const members = await api("GET", `/api/workspaces/${state.workspaceId}/members`);
   const error = h("p", { class: "error", role: "alert" });
   const inviteHost = h("div", {});
+  const openInvites = h("div", { class: "row-list" });
+
+  const drawInvites = async () => {
+    const invites = await api("GET", `/api/workspaces/${state.workspaceId}/invites`);
+    openInvites.replaceChildren(...(invites.length ? [h("p", { class: "note" }, "Open invites")] : []),
+      ...invites.map((invite) => h("div", {},
+        h("span", {}, `Used ${invite.uses} of ${invite.max_uses}, ends ${new Date(invite.expires_at).toLocaleDateString()}`),
+        h("button", {
+          class: "btn plain",
+          onclick: async () => {
+            try {
+              await api("DELETE", `/api/workspaces/${state.workspaceId}/invites/${invite.id}`);
+              inviteHost.replaceChildren();
+              await drawInvites();
+            } catch (err) { error.textContent = err.message; }
+          },
+        }, "Cancel invite"))));
+  };
 
   const rows = members.map((m) => h("div", {},
     h("span", {}, m.username, m.role === "owner" ? " (owner)" : ""),
@@ -738,6 +795,7 @@ async function peopleDialog() {
     h("p", { class: "note" }, "Everyone here can read every conversation in this workspace and talk to its agents."),
     h("div", { class: "row-list" }, rows),
     error,
+    isOwner && openInvites,
     isOwner && inviteHost,
     h("div", { class: "dlg-actions" },
       isOwner && h("button", {
@@ -748,11 +806,13 @@ async function peopleDialog() {
             inviteHost.replaceChildren(
               h("p", {}, "Send this link to one person. It works once, for 7 days."),
               commandBlock(`${origin}/#/invite/${created.code}`));
+            await drawInvites();
           } catch (err) { error.textContent = err.message; }
         },
       }, "Create invite link"),
       h("button", { class: "btn", onclick: () => dialog.close() }, "Close")));
   const dialog = showDialog(content);
+  if (isOwner) drawInvites().catch((err) => { error.textContent = err.message; });
 }
 
 function accountDialog() {

@@ -195,6 +195,11 @@ approve each one. That file holds your token in hook mode, make sure it is ignor
   picks it up through `check_inbox` when it starts.
 - **Two sessions use the same agent.** The newest one receives messages, the older one
   is told about it.
+- **An agent gets removed in the web UI.** Its session is cut off and told to inform you.
+  Anyone blocked on its answer gets told right away, and connected sessions with an open
+  question to it get a notice. Asking it again returns a clear error. History stays.
+- **A token gets replaced.** The session using the old one is told to run setup again.
+- **A member gets removed.** Their agents are revoked and their browser is cut off at once.
 - **Two agents talk in circles.** A thread stops at 50 messages by default and the agents
   are told to check with their user.
 - **The database gets damaged.** The hub refuses to start and says so rather than write
