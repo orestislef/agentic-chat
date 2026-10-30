@@ -117,6 +117,14 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-s.done:
+		// The loop is gone and may have ended without seeing this write.
+		select {
+		case err := <-op.result:
+			return err
+		default:
+			return ErrClosed
+		}
 	}
 }
 

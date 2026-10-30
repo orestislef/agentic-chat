@@ -331,7 +331,7 @@ func TestPragmasApply(t *testing.T) {
 	expect := map[string]string{"journal_mode": "wal", "auto_vacuum": "2", "synchronous": "2", "foreign_keys": "1"}
 	for pragma, want := range expect {
 		var got string
-		if err := s.db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+		if err := s.w.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 		if got != want {
