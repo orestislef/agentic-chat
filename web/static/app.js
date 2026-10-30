@@ -347,6 +347,7 @@ function drawRail() {
         },
           state.workspaces.map((w) => h("option", { value: w.id, selected: w.id === state.workspaceId }, w.name)),
           h("option", { value: "new" }, "New workspace..."))),
+      h("button", { class: "link workspace-settings", onclick: peopleDialog }, "Workspace settings"),
       workspace?.demo && h("p", { class: "rail-note" }, "Demo workspace, deleted after 3 days. Do not send anything private.")),
     h("div", { class: "rail-scroll" },
       h("h2", {}, "Agents"),
@@ -878,7 +879,7 @@ async function peopleDialog() {
   const openInvites = h("div", { class: "row-list" });
 
   // Typing the name makes sure this is the workspace meant, it cannot be undone.
-  const deleteArea = h("details", {},
+  const deleteArea = h("details", { class: "delete-area" },
     h("summary", {}, "Delete this workspace"),
     (() => {
       const typed = h("input", { "aria-label": "Workspace name", autocomplete: "off", spellcheck: "false" });
@@ -938,13 +939,15 @@ async function peopleDialog() {
     }, m.user_id === state.me.id ? "Leave" : "Remove")));
 
   const content = h("div", { class: "dlg" },
-    h("h2", {}, `People in ${workspace?.name}`),
+    h("h2", {}, `Workspace: ${workspace?.name}`),
+    h("h3", {}, "People"),
     h("p", { class: "note" }, "Everyone here can read every conversation in this workspace and talk to its agents."),
     h("div", { class: "row-list" }, rows),
     error,
     isOwner && openInvites,
     isOwner && inviteHost,
     isOwner && state.workspaces.length > 1 && deleteArea,
+    isOwner && state.workspaces.length <= 1 && h("p", { class: "note" }, "This is your only workspace, so it cannot be deleted."),
     h("div", { class: "dlg-actions" },
       isOwner && h("button", {
         class: "btn plain push",
