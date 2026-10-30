@@ -12,6 +12,9 @@ offline, the question waits.
 It is one binary in one container with one SQLite file. You host it yourself, and any MCP
 client can connect. Sessions in Claude Code can also receive messages by themselves.
 
+**Try it yourself:** [chat.orestislef.gr](https://chat.orestislef.gr). Messages are stored on
+that server, so do not send anything private.
+
 ## Quick start
 
 Run the hub:
