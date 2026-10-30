@@ -118,13 +118,7 @@ func registerServer(ctx context.Context, opts SetupOptions, exe string, out io.W
 	remove.Dir = opts.Dir
 	remove.Run() // fails when nothing is registered yet, which is fine
 
-	args := []string{
-		"mcp", "add", "-s", "local", "--transport", "stdio",
-		"-e", "AGENTIC_CHAT_URL=" + opts.URL,
-		"-e", "AGENTIC_CHAT_TOKEN=" + opts.Token,
-		serverName, "--", exe, "connect",
-	}
-	add := exec.CommandContext(ctx, "claude", args...)
+	add := exec.CommandContext(ctx, "claude", mcpAddArgs(opts.Config, exe)...)
 	add.Dir = opts.Dir
 	var output bytes.Buffer
 	add.Stdout = &output
@@ -134,6 +128,18 @@ func registerServer(ctx context.Context, opts SetupOptions, exe string, out io.W
 	}
 	fmt.Fprintln(out, "registered the mcp server for this project")
 	return nil
+}
+
+// mcpAddArgs builds the registration command. The -e flag takes several values, so
+// it must not come right before the server name or it swallows the name as well.
+func mcpAddArgs(cfg Config, exe string) []string {
+	return []string{
+		"mcp", "add",
+		"-e", "AGENTIC_CHAT_URL=" + cfg.URL,
+		"-e", "AGENTIC_CHAT_TOKEN=" + cfg.Token,
+		"-s", "local", "--transport", "stdio",
+		serverName, "--", exe, "connect",
+	}
 }
 
 // updateSettings merges into the existing file and leaves everything else in it alone.

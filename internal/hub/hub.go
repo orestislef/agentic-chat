@@ -386,6 +386,13 @@ func (h *Hub) Redeliver(ctx context.Context, a *store.Agent, c *Conn) error {
 	return nil
 }
 
+// Connected reports whether an agent holds a live push connection right now.
+func (h *Hub) Connected(agentID int64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.conns[agentID] != nil
+}
+
 // Detach removes a connection when its socket ends.
 func (h *Hub) Detach(a *store.Agent, c *Conn) {
 	h.mu.Lock()

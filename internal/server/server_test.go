@@ -369,7 +369,11 @@ func TestPushOverWebsocketAndRevoke(t *testing.T) {
 
 	// Revoking ends the connection with a code the client recognises and kills the token.
 	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/agents/"+strconv.FormatInt(agentID, 10), nil, http.StatusNoContent, nil)
-	_, _, err := conn.Read(ctx)
+	// A copy of the message can still be in the pipe, delivery is at least once.
+	var err error
+	for err == nil {
+		_, _, err = conn.Read(ctx)
+	}
 	if websocket.CloseStatus(err) != closeRevoked {
 		t.Fatalf("expected the revoked close code, got %v", err)
 	}
@@ -518,5 +522,34 @@ func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
 	}
 	if strings.Contains(inbox(bobToken), "private plans") {
 		t.Fatal("message leaked to another workspace")
+	}
+}
+
+func TestStandbyDialLeavesCurrentHolderAlone(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	_, token := owner.createAgent(ws, "backend")
+	holder := dialAgent(t, ts, token)
+	_ = holder
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	var err error
+	for time.Now().Before(deadline) {
+		var conn *websocket.Conn
+		conn, resp, err = websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws?standby=1", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+		})
+		if err != nil {
+			break
+		}
+		conn.CloseNow() // the holder had not registered yet, try again
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err == nil || resp == nil || resp.StatusCode != http.StatusConflict {
+		t.Fatalf("standby dial should be refused, got %v %+v", err, resp)
 	}
 }

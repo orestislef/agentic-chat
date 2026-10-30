@@ -42,6 +42,13 @@ const (
 	pingEvery   = 30 * time.Second
 	pingTimeout = 15 * time.Second
 
+	// pushDelay keeps a short lived process from touching the agent's connection.
+	// Health checks start the server just to list its tools, and would otherwise
+	// push a running session off its slot for a moment.
+	pushDelay = 2 * time.Second
+	// standbyEvery is how often a replaced session checks whether the slot came free.
+	standbyEvery = 15 * time.Second
+
 	// Close codes sent by the hub, see internal/server.
 	closeSuperseded = websocket.StatusCode(4001)
 	closeRevoked    = websocket.StatusCode(4003)
@@ -88,6 +95,8 @@ type Bridge struct {
 	retryDelays []time.Duration
 	pingEvery   time.Duration
 	pingTimeout time.Duration
+	pushDelay   time.Duration
+	standby     time.Duration
 }
 
 // NewBridge creates a bridge over the given streams.
@@ -104,6 +113,8 @@ func NewBridge(cfg Config, in io.Reader, out io.Writer, log *slog.Logger) *Bridg
 		retryDelays: []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second},
 		pingEvery:   pingEvery,
 		pingTimeout: pingTimeout,
+		pushDelay:   pushDelay,
+		standby:     standbyEvery,
 	}
 }
 
@@ -309,42 +320,75 @@ func (b *Bridge) startPush(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 // pushLoop keeps the websocket to the hub open, reconnecting until the session
-// ends or the hub says this connection should stay closed.
+// ends or the token stops working. A session replaced by a newer one on the same
+// agent stays on standby and takes over again once that one is gone.
 func (b *Bridge) pushLoop(ctx context.Context) {
+	if !sleepCtx(ctx, b.pushDelay) {
+		return
+	}
 	backoff := time.Second
+	standby := false
+	toldReplaced := false
 	for ctx.Err() == nil {
-		connected, err := b.pushOnceConnected(ctx)
+		connected, err := b.connectPush(ctx, standby, func() {
+			if toldReplaced {
+				b.notifySystem("The other session on this agent is gone, this session receives messages again.")
+				toldReplaced = false
+			}
+			standby = false
+		})
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, errTokenRejected) {
+		switch {
+		case errors.Is(err, errTokenRejected):
 			b.notifySystem("The hub rejected this agent's token, so this session receives no messages. Tell your user to set up the agent again.")
 			return
-		}
-		switch websocket.CloseStatus(err) {
-		case closeSuperseded:
-			b.notifySystem("Another session connected with this agent's token, so this session no longer receives messages. The tools still work. Tell your user if that is not what they intended.")
-			return
-		case closeRevoked:
+		case websocket.CloseStatus(err) == closeRevoked:
 			b.notifySystem("This agent's token was revoked or rotated, so this session no longer receives messages. Tell your user to set up the agent again.")
 			return
+		case websocket.CloseStatus(err) == closeSuperseded:
+			standby = true
+			if !sleepCtx(ctx, b.standby) {
+				return
+			}
+			continue
+		case errors.Is(err, errSlotTaken):
+			// Still taken after a while, so this is another real session and not a blip.
+			if !toldReplaced {
+				b.notifySystem("Another session connected with this agent's token, so this session no longer receives messages. The tools still work. Tell your user if that is not what they intended.")
+				toldReplaced = true
+			}
+			if !sleepCtx(ctx, b.standby) {
+				return
+			}
+			continue
 		}
 		if connected {
 			backoff = time.Second
 		}
 		b.log.Warn("hub connection lost, retrying", "err", err, "in", backoff)
-		sleep := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
-		select {
-		case <-time.After(sleep):
-		case <-ctx.Done():
+		if !sleepCtx(ctx, backoff+time.Duration(rand.Int64N(int64(backoff/2)+1))) {
 			return
 		}
 		backoff = min(backoff*2, 30*time.Second)
 	}
 }
 
-func (b *Bridge) pushOnceConnected(ctx context.Context) (bool, error) {
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (b *Bridge) connectPush(ctx context.Context, standby bool, onConnected func()) (bool, error) {
 	wsURL := "ws" + strings.TrimPrefix(b.cfg.URL, "http") + "/api/agent/ws"
+	if standby {
+		wsURL += "?standby=1"
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	conn, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
@@ -354,11 +398,15 @@ func (b *Bridge) pushOnceConnected(ctx context.Context) (bool, error) {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			return false, errTokenRejected
 		}
+		if resp != nil && resp.StatusCode == http.StatusConflict {
+			return false, errSlotTaken
+		}
 		return false, err
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(maxFrameBytes)
 	b.log.Info("connected to hub", "url", b.cfg.URL)
+	onConnected()
 
 	// A cable pulled or a laptop lid closed gives no close signal, a read would just
 	// wait forever. Unanswered pings are the only way to notice from this side.
@@ -434,7 +482,10 @@ func (b *Bridge) notifySystem(text string) {
 	b.notify(text, map[string]string{"from": "agentic-chat", "kind": "system"})
 }
 
-var errTokenRejected = errors.New("token rejected")
+var (
+	errTokenRejected = errors.New("token rejected")
+	errSlotTaken     = errors.New("another session holds this agent")
+)
 
 var channelTagRE = regexp.MustCompile(`(?i)<(/?channel)`)
 

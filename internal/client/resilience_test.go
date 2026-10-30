@@ -88,6 +88,8 @@ func fastSession(t *testing.T, url, token string) *session {
 	bridge.retryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1600 * time.Millisecond}
 	bridge.pingEvery = 100 * time.Millisecond
 	bridge.pingTimeout = 300 * time.Millisecond
+	bridge.pushDelay = 0
+	bridge.standby = 100 * time.Millisecond
 	go func() {
 		bridge.Run(context.Background())
 		close(s.done)
@@ -513,5 +515,87 @@ func TestWatchKeepsMessageUntilItHasIt(t *testing.T) {
 	unread, _ := w.store.Unread(context.Background(), w.backendID, 10)
 	if len(unread) != 0 {
 		t.Fatalf("confirmed message still unread: %+v", unread)
+	}
+}
+
+func TestReplacedSessionWaitsAndTakesOverAgain(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+
+	older := fastSession(t, srv.URL, w.back)
+	older.initialize()
+	time.Sleep(200 * time.Millisecond)
+
+	newer := fastSession(t, srv.URL, w.back)
+	newer.initialize()
+
+	notice := older.nextPush(5 * time.Second)
+	if !strings.Contains(notice["content"].(string), "Another session") || notice["meta"].(map[string]any)["kind"] != "system" {
+		t.Fatalf("notice: %v", notice)
+	}
+
+	// While the newer session lives it gets the messages, the older one stays quiet.
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "for the newer one"})
+	if got := newer.nextPush(5 * time.Second); got["content"] != "for the newer one" {
+		t.Fatalf("newer got %v", got)
+	}
+
+	// The newer session ends, the older one takes the slot back.
+	newer.stdin.Close()
+	select {
+	case <-newer.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("newer session did not end")
+	}
+	back := older.nextPush(5 * time.Second)
+	if !strings.Contains(back["content"].(string), "again") {
+		t.Fatalf("expected the all clear, got %v", back)
+	}
+	front.tool(3, "send_message", map[string]any{"to": "backend", "message": "for the older one"})
+	// The earlier message may come along too: the newer session can end before its ack
+	// reaches the hub, and delivery is at least once. What must not happen is a gap.
+	for {
+		got := older.nextPush(5 * time.Second)
+		if got["content"] == "for the older one" {
+			return
+		}
+		if got["content"] != "for the newer one" {
+			t.Fatalf("older got %v", got)
+		}
+	}
+}
+
+func TestShortLivedProcessDoesNotDisturbRunningSession(t *testing.T) {
+	w := newWorld(t)
+	srv := httptest.NewServer(w.handler())
+	defer srv.Close()
+
+	running := fastSession(t, srv.URL, w.back)
+	running.initialize()
+	time.Sleep(200 * time.Millisecond)
+
+	// A health check: start, handshake, list tools, gone within the delay.
+	inR, inW := io.Pipe()
+	bridge := NewBridge(Config{URL: srv.URL, Token: w.back}, inR, io.Discard, quietLog())
+	bridge.pushDelay = 500 * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		bridge.Run(context.Background())
+		close(done)
+	}()
+	io.WriteString(inW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n")
+	io.WriteString(inW, `{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n")
+	inW.Close()
+	<-done
+
+	front := fastSession(t, srv.URL, w.front)
+	front.initialize()
+	front.tool(2, "send_message", map[string]any{"to": "backend", "message": "still here?"})
+	got := running.nextPush(5 * time.Second)
+	if got["content"] != "still here?" {
+		t.Fatalf("running session was disturbed: %v", got)
 	}
 }

@@ -298,6 +298,12 @@ type AgentFrame struct {
 
 // handleAgentSocket is the live push connection of a bridge.
 func (s *Server) handleAgentSocket(w http.ResponseWriter, r *http.Request, a *store.Agent) {
+	// A client that was replaced earlier asks with standby=1: it takes the slot when
+	// it is free and leaves the current holder alone when it is not.
+	if r.URL.Query().Get("standby") == "1" && s.hub.Connected(a.ID) {
+		writeError(w, http.StatusConflict, "another session holds this agent")
+		return
+	}
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return

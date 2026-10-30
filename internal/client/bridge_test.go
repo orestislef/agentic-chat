@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,7 @@ func openSession(t *testing.T, url, token string) *session {
 	outR, outW := io.Pipe()
 	s := &session{t: t, stdin: inW, lines: make(chan map[string]any, 64), done: make(chan struct{})}
 	bridge := NewBridge(Config{URL: url, Token: token}, inR, outW, quietLog())
+	bridge.pushDelay = 0
 	go func() {
 		bridge.Run(context.Background())
 		close(s.done)
@@ -256,31 +258,6 @@ func TestMessageSentWhileOfflineArrivesOnConnect(t *testing.T) {
 	if push["method"] != channelMethod || push["params"].(map[string]any)["content"] != "are you there?" {
 		t.Fatalf("push: %v", push)
 	}
-}
-
-func TestOlderSessionIsToldItWasReplaced(t *testing.T) {
-	st := newStack(t)
-	first := openSession(t, st.url, st.back)
-	first.initialize()
-	waitForSocket(t, first)
-
-	second := openSession(t, st.url, st.back)
-	second.initialize()
-
-	notice := first.next()
-	params := notice["params"].(map[string]any)
-	if notice["method"] != channelMethod || !strings.Contains(params["content"].(string), "Another session") {
-		t.Fatalf("notice: %v", notice)
-	}
-	if params["meta"].(map[string]any)["kind"] != "system" {
-		t.Fatalf("notice kind: %v", params["meta"])
-	}
-}
-
-// waitForSocket gives the push loop a moment to connect, it starts in the background.
-func waitForSocket(t *testing.T, s *session) {
-	t.Helper()
-	time.Sleep(200 * time.Millisecond)
 }
 
 func TestBadTokenBecomesToolError(t *testing.T) {
@@ -511,5 +488,20 @@ func TestConfigValidate(t *testing.T) {
 	good.Validate()
 	if good.URL != "https://hub.example" {
 		t.Fatalf("trailing slash kept: %s", good.URL)
+	}
+}
+
+func TestServerNameDoesNotFollowEnvFlag(t *testing.T) {
+	args := mcpAddArgs(Config{URL: "https://hub.example", Token: "t"}, "/bin/agentic-chat")
+	name := slices.Index(args, serverName)
+	if name < 1 {
+		t.Fatalf("no server name in %v", args)
+	}
+	// Two positions back is where a -e flag would sit if its value came right before the name.
+	if name >= 2 && args[name-2] == "-e" {
+		t.Fatalf("the -e flag would swallow the server name: %v", args)
+	}
+	if args[name+1] != "--" {
+		t.Fatalf("command must follow a -- separator: %v", args)
 	}
 }
