@@ -193,9 +193,77 @@ function demoDiagram() {
 
 // Main screen
 
+// Set while a coding session is signing in through this page.
+function oauthRequest() {
+  if (location.pathname !== "/oauth/authorize") return null;
+  return Object.fromEntries(new URLSearchParams(location.search));
+}
+
+async function renderConsent(request) {
+  const error = h("p", { class: "error", role: "alert" });
+  let client;
+  try {
+    client = await api("GET", `/api/oauth/client?client_id=${encodeURIComponent(request.client_id || "")}&redirect_uri=${encodeURIComponent(request.redirect_uri || "")}`);
+  } catch (err) {
+    app.replaceChildren(h("main", { class: "auth" }, h("div", { class: "auth-story" }, h("h1", {}, "Could not connect"), h("p", {}, err.message))));
+    return;
+  }
+  const choice = h("select", {}, state.workspaces.map((w) => h("option", { value: w.id }, w.name)));
+  const allow = h("button", { class: "btn", type: "submit" }, "Allow");
+  const deny = h("button", {
+    class: "btn plain", type: "button",
+    onclick: () => {
+      const target = new URL(request.redirect_uri);
+      target.searchParams.set("error", "access_denied");
+      if (request.state) target.searchParams.set("state", request.state);
+      location.assign(target);
+    },
+  }, "Cancel");
+  app.replaceChildren(h("main", { class: "auth" },
+    h("div", { class: "auth-story" },
+      h("h1", {}, "Connect your coding session."),
+      h("p", {}, "Each chat joins as its own agent, and agents in a workspace can message each other and read its conversations.")),
+    h("div", { class: "auth-form" }, h("form", {
+      class: "dlg",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        allow.disabled = true;
+        error.textContent = "";
+        try {
+          const approved = await api("POST", "/api/oauth/approve", {
+            client_id: request.client_id,
+            redirect_uri: request.redirect_uri,
+            state: request.state || "",
+            code_challenge: request.code_challenge || "",
+            code_challenge_method: request.code_challenge_method || "",
+            workspace_id: Number(choice.value),
+          });
+          app.replaceChildren(h("main", { class: "auth" }, h("div", { class: "auth-story" },
+            h("h1", {}, "Connected."), h("p", {}, "You can close this page and go back to your session."))));
+          location.assign(approved.redirect);
+        } catch (err) {
+          error.textContent = err.message;
+          allow.disabled = false;
+        }
+      },
+    },
+      h("h2", {}, `Allow ${client.name}?`),
+      h("p", { class: "note" }, `Signed in as ${state.me.username}.`),
+      state.workspaces.length > 1
+        ? h("label", {}, "Workspace", choice)
+        : h("p", {}, `Workspace: ${state.workspaces[0]?.name ?? "none"}`),
+      error,
+      h("div", { class: "dlg-actions" }, deny, allow)))));
+}
+
 async function start() {
   state.me = await api("GET", "/api/me");
   state.workspaces = await api("GET", "/api/workspaces");
+  const signingIn = oauthRequest();
+  if (signingIn) {
+    await renderConsent(signingIn);
+    return;
+  }
   const invite = inviteFromURL();
   if (invite) {
     try {
@@ -281,7 +349,7 @@ function drawRail() {
       coding.map((a) => h("button", { class: "jack", onclick: () => agentDialog(a) },
         lamp(a.state),
         h("span", { class: "name" }, a.name, a.description && h("span", { class: "what" }, a.description)))),
-      h("button", { class: "btn rail-add", onclick: addAgentDialog }, "Add agent"),
+      h("button", { class: "btn rail-add", onclick: connectDialog }, "Connect Claude Code"),
       h("h2", {}, "People"),
       people.map((a) => h("button", { class: "jack", onclick: () => peopleDialog() },
         lamp(a.state), h("span", { class: "name" }, a.name))),
@@ -358,13 +426,14 @@ function drawSheet() {
   const coding = state.agents.filter((a) => a.kind === "agent");
   if (coding.length < 2 && !state.threadId) {
     refs.sheet.replaceChildren(backButton, banner || "", h("div", { class: "seq-empty" },
-      h("h2", {}, coding.length ? "Add a second agent" : "Connect your first two sessions"),
-      h("p", {}, "Each coding session joins as an agent with its own name. Once two are connected, they can ask each other questions."),
+      h("h2", {}, coding.length ? "Open a second chat" : "Connect your coding sessions"),
+      h("p", {}, "Nothing to install. Run this once, and every chat joins as its own agent, named after its project."),
+      commandBlock(connectCommand()),
       h("ol", {},
-        h("li", {}, "Add an agent, for example ", h("code", {}, "frontend"), ", and run its setup command in that project."),
-        h("li", {}, "Do the same for ", h("code", {}, "backend"), " in the other project."),
-        h("li", {}, "Tell one session to ask the other something.")),
-      h("button", { class: "btn", onclick: addAgentDialog }, "Add agent")));
+        h("li", {}, "In a chat, run ", h("code", {}, "/mcp"), " and sign in when your browser opens."),
+        h("li", {}, "Open chats in two projects."),
+        h("li", {}, "Tell one to ask the other something.")),
+      h("button", { class: "btn plain", onclick: connectDialog }, "More ways to connect")));
     return;
   }
 
@@ -687,6 +756,25 @@ function setupSteps(token) {
       commandBlock(`claude mcp add --transport http agentic-chat ${origin}/mcp --header "Authorization: Bearer ${token}"`)));
 }
 
+function connectCommand() {
+  return `claude mcp add --transport http -s user agentic-chat ${origin}/mcp`;
+}
+
+function connectDialog() {
+  const dialog = showDialog(h("div", { class: "dlg" },
+    h("h2", {}, "Connect Claude Code"),
+    h("ol", { class: "steps" },
+      h("li", {}, "Run this once. There is nothing to install.", commandBlock(connectCommand())),
+      h("li", {}, "In any chat, run ", h("code", {}, "/mcp"), ", select agentic-chat and sign in when your browser opens."),
+      h("li", {}, "Every chat now joins as its own agent, named after its project.")),
+    h("p", { class: "note" }, "A chat only sees new messages when it does something. To keep one waiting for messages, tell it to stay and listen, which uses tokens while it runs."),
+    h("details", {},
+      h("summary", {}, "Have idle chats wake up by themselves"),
+      h("p", { class: "note" }, "This needs a small program on your machine, and one agent per project."),
+      h("button", { class: "btn plain", onclick: () => { dialog.close(); addAgentDialog(); } }, "Add an agent with its own token")),
+    h("div", { class: "dlg-actions" }, h("button", { class: "btn", onclick: () => dialog.close() }, "Done"))));
+}
+
 function addAgentDialog() {
   const error = h("p", { class: "error", role: "alert" });
   const name = h("input", { required: true, maxlength: 32, autocapitalize: "none", spellcheck: "false", placeholder: "backend" });
@@ -832,6 +920,23 @@ function accountDialog() {
   const current = h("input", { type: "password", required: true, autocomplete: "current-password" });
   const next = h("input", { type: "password", required: true, minlength: 10, autocomplete: "new-password" });
   const submit = h("button", { class: "btn", type: "submit" }, "Change password");
+  const connections = h("div", { class: "row-list" });
+  const drawConnections = async () => {
+    const list = await api("GET", "/api/me/connections");
+    connections.replaceChildren(...(list.length ? [h("p", { class: "note" }, "Signed in clients")] : []),
+      ...list.map((c) => h("div", {},
+        h("span", {}, `${c.client_name}, ${c.workspace}, used ${formatTime(c.last_used_at)}`),
+        h("button", {
+          class: "btn plain", type: "button",
+          onclick: async () => {
+            try {
+              await api("DELETE", `/api/me/connections/${c.id}`);
+              await drawConnections();
+            } catch (err) { error.textContent = err.message; }
+          },
+        }, "Sign out"))));
+  };
+  drawConnections().catch((err) => { error.textContent = err.message; });
   const dialog = showDialog(h("form", {
     class: "dlg",
     onsubmit: async (event) => {
@@ -847,6 +952,7 @@ function accountDialog() {
     h("h2", {}, `Account: ${state.me.username}`),
     h("label", {}, "Current password", current),
     h("label", {}, "New password", h("span", { class: "hint" }, "At least 10 characters"), next),
+    connections,
     error,
     h("div", { class: "dlg-actions" },
       h("button", { class: "btn plain", type: "button", onclick: () => dialog.close() }, "Close"),
