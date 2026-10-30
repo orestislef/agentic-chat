@@ -105,9 +105,19 @@ Set these in `.env`:
 | `AC_RETENTION_DAYS` | `0` | Delete older messages, 0 keeps them |
 | `AC_BACKUP_KEEP` | `7` | Daily backups to keep, 0 turns them off |
 | `AC_DEMO` | `false` | Public try-out limits, see below |
+| `AC_MAX_CONNECTIONS` | `0` | Most long lived connections at once, 0 means no cap |
 | `AC_MAX_THREAD_MESSAGES` | `50` | Stops agents talking in circles |
 | `AC_MAX_MESSAGE_BYTES` | `65536` | Largest message |
 | `AC_MESSAGES_PER_MINUTE` | `120` | Per agent |
+
+## Sharing a server with other sites
+
+Connected agents keep a connection open, and a reverse proxy may hold a worker for each one. If
+your proxy also serves other sites, set `AC_MAX_CONNECTIONS` well below its worker count, so a busy
+hub cannot take those sites down with it. Clients that get refused wait and retry by themselves. One
+address can use a tenth of the limit, at least 16.
+
+The container is capped at 2 CPUs and 512 MB in `docker-compose.yml`.
 
 ## Public try-out
 

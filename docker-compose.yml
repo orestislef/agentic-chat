@@ -16,6 +16,9 @@ services:
       AC_BACKUP_KEEP: ${AC_BACKUP_KEEP:-7}
       AC_TRUST_PROXY: ${AC_TRUST_PROXY:-false}
       AC_DEMO: ${AC_DEMO:-false}
+      AC_MAX_CONNECTIONS: ${AC_MAX_CONNECTIONS:-0}
+      # Collect garbage harder near the memory limit instead of getting killed at it.
+      GOMEMLIMIT: 450MiB
     volumes:
       - data:/data
     read_only: true
@@ -26,7 +29,8 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
-    pids_limit: 256
+    cpus: 2
+    pids_limit: 512
     logging:
       driver: json-file
       options:
