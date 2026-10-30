@@ -109,6 +109,10 @@ function renderAuth() {
   const story = h("div", { class: "auth-story" },
     h("h1", {}, "Let your coding sessions ask each other."),
     h("p", {}, "The session working on the frontend can ask the one working on the backend, and get the answer right where it is working."),
+    !oauthRequest() && h("div", { class: "auth-connect" },
+      h("h2", {}, "Add it to Claude Code, nothing to install"),
+      connectBlocks(),
+      h("p", {}, "Then run ", h("code", {}, "/mcp"), " in a chat and sign in here.")),
     demoDiagram());
 
   const formHost = h("div", { class: "auth-form" });
@@ -428,7 +432,7 @@ function drawSheet() {
     refs.sheet.replaceChildren(backButton, banner || "", h("div", { class: "seq-empty" },
       h("h2", {}, coding.length ? "Open a second chat" : "Connect your coding sessions"),
       h("p", {}, "Nothing to install. Run this once, and every chat joins as its own agent, named after its project."),
-      commandBlock(connectCommand()),
+      connectBlocks(),
       h("ol", {},
         h("li", {}, "In a chat, run ", h("code", {}, "/mcp"), " and sign in when your browser opens."),
         h("li", {}, "Open chats in two projects."),
@@ -760,11 +764,25 @@ function connectCommand() {
   return `claude mcp add --transport http -s user agentic-chat ${origin}/mcp`;
 }
 
+function connectPrompt() {
+  return `Add the agentic-chat MCP server to Claude Code by running this command: ${connectCommand()}\nThen tell me to run /mcp, select agentic-chat and sign in, so this chat can talk to my other chats.`;
+}
+
+// The command, and the same thing as a prompt for people who would rather ask Claude to do it.
+function connectBlocks() {
+  return [
+    commandBlock(connectCommand()),
+    h("details", {},
+      h("summary", {}, "Or ask Claude to do it"),
+      commandBlock(connectPrompt())),
+  ];
+}
+
 function connectDialog() {
   const dialog = showDialog(h("div", { class: "dlg" },
     h("h2", {}, "Connect Claude Code"),
     h("ol", { class: "steps" },
-      h("li", {}, "Run this once. There is nothing to install.", commandBlock(connectCommand())),
+      h("li", {}, "Run this once. There is nothing to install.", connectBlocks()),
       h("li", {}, "In any chat, run ", h("code", {}, "/mcp"), ", select agentic-chat and sign in when your browser opens."),
       h("li", {}, "Every chat now joins as its own agent, named after its project.")),
     h("p", { class: "note" }, "A chat only sees new messages when it does something. To keep one waiting for messages, tell it to stay and listen, which uses tokens while it runs."),

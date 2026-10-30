@@ -96,6 +96,13 @@ label input, label select, label textarea { margin-top: 0.25rem; }
 .auth-story { padding: 3.5rem clamp(1.5rem, 6vw, 5rem); color: var(--panel-text); align-self: center; }
 .auth-story h1 { font-size: clamp(var(--step-3), 4vw, 3.25rem); line-height: 1.08; font-weight: 600; max-width: 16ch; }
 .auth-story p { margin-top: 1rem; max-width: 42ch; color: var(--panel-dim); }
+.auth-connect { margin-top: 2rem; max-width: 40rem; display: grid; gap: 0.5rem; }
+.auth-connect h2 { color: var(--panel-text); }
+.auth-connect p { margin-top: 0; }
+.auth-connect .cmd pre { background: var(--panel-up); border: 1px solid var(--panel-line); margin: 0; }
+.auth-connect .cmd button { background: var(--panel); }
+.auth-connect details { color: var(--panel-dim); }
+.auth-connect code { background: var(--panel-up); border-radius: 3px; padding: 0 0.25rem; color: var(--panel-text); }
 .auth-demo { margin-top: 2.5rem; max-width: 34rem; display: block; width: 100%; }
 .auth-demo text { fill: var(--panel-text); font-size: 13px; }
 .auth-demo .life { stroke: var(--panel-line); stroke-width: 1.5; }
