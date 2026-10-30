@@ -82,6 +82,10 @@ func (h *staticHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "index.html"
 	}
+	h.serveFile(w, r, name)
+}
+
+func (h *staticHandler) serveFile(w http.ResponseWriter, r *http.Request, name string) {
 	f := h.files[name]
 	if f == nil {
 		http.NotFound(w, r)

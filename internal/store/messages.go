@@ -20,6 +20,7 @@ type Agent struct {
 	Kind        string `json:"kind"`
 	LastSeenAt  int64  `json:"last_seen_at,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
+	Auto        bool   `json:"auto,omitempty"`
 }
 
 // Message is one entry in the history of a workspace.
@@ -48,12 +49,12 @@ type Thread struct {
 	LastAt       int64    `json:"last_at"`
 }
 
-const agentColumns = `id, workspace_id, user_id, name, description, kind, last_seen_at, created_at`
+const agentColumns = `id, workspace_id, user_id, name, description, kind, last_seen_at, created_at, auto`
 
 func scanAgent(row interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var seen sql.NullInt64
-	if err := row.Scan(&a.ID, &a.WorkspaceID, &a.UserID, &a.Name, &a.Description, &a.Kind, &seen, &a.CreatedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.WorkspaceID, &a.UserID, &a.Name, &a.Description, &a.Kind, &seen, &a.CreatedAt, &a.Auto); err != nil {
 		return nil, rowErr(err)
 	}
 	a.LastSeenAt = nullMillis(seen)

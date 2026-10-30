@@ -585,3 +585,186 @@ func TestWriteAfterCloseFailsCleanly(t *testing.T) {
 		t.Fatal("write after close hangs")
 	}
 }
+
+func joinFixture(t *testing.T, s *Store) (*Connection, *User, int64) {
+	t.Helper()
+	ctx := context.Background()
+	u, err := s.CreateAccount(ctx, "owner", "h", "", "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ := s.WorkspacesForUser(ctx, u.ID)
+	if err := s.CreateConnection(ctx, "conn-token", "client", u.ID, list[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.ConnectionByToken(ctx, "conn-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, u, list[0].ID
+}
+
+func TestJoinNamesAndReclaims(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, _, ws := joinFixture(t, s)
+
+	first, created, err := s.JoinAgent(ctx, conn, "chat-1", "backend", 0)
+	if err != nil || !created || first.Name != "backend" || !first.Auto {
+		t.Fatalf("first: %v %v %+v", err, created, first)
+	}
+	// Another chat in the same project while the first is active gets its own agent.
+	second, created, err := s.JoinAgent(ctx, conn, "chat-2", "backend", 0)
+	if err != nil || !created || second.Name != "backend-2" {
+		t.Fatalf("second: %v %v %+v", err, created, second)
+	}
+	// The same chat joining again changes nothing.
+	again, created, err := s.JoinAgent(ctx, conn, "chat-1", "backend", 0)
+	if err != nil || created || again.ID != first.ID {
+		t.Fatalf("again: %v %v %+v", err, created, again)
+	}
+	// Once the first chat is gone, a new chat in that project takes over its identity.
+	if err := s.EndSession(ctx, "chat-1"); err != nil {
+		t.Fatal(err)
+	}
+	third, created, err := s.JoinAgent(ctx, conn, "chat-3", "backend", 0)
+	if err != nil || created || third.ID != first.ID {
+		t.Fatalf("reopen: %v %v %+v", err, created, third)
+	}
+	state, err := s.SessionAgent(ctx, "chat-3")
+	if err != nil || state.Removed || state.Agent.ID != first.ID || state.Wanted != "backend" {
+		t.Fatalf("session agent: %v %+v", err, state)
+	}
+
+	// Removing the agent in the web UI is visible to the chat, not silently replaced.
+	s.RevokeAgent(ctx, ws, first.ID)
+	state, err = s.SessionAgent(ctx, "chat-3")
+	if err != nil || !state.Removed || state.Agent != nil {
+		t.Fatalf("after removal: %v %+v", err, state)
+	}
+	state, _ = s.SessionAgent(ctx, "never-seen")
+	if state.Agent != nil || state.Removed {
+		t.Fatalf("unknown session: %+v", state)
+	}
+}
+
+func TestJoinNeverTakesAnotherUsersName(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, _, ws := joinFixture(t, s)
+	other, _ := s.CreateAccount(ctx, "other", "h", "", "theirs")
+	if _, err := s.CreateAgent(ctx, ws, other.ID, "backend", "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	a, _, err := s.JoinAgent(ctx, conn, "chat", "backend", 0)
+	if err != nil || a.Name != "backend-2" {
+		t.Fatalf("%v %+v", err, a)
+	}
+	// A person's name is not available for an agent either.
+	b, _, err := s.JoinAgent(ctx, conn, "chat-b", "owner", 0)
+	if err != nil || b.Name != "owner-2" {
+		t.Fatalf("%v %+v", err, b)
+	}
+}
+
+func TestJoinRespectsLimitButReclaimStillWorks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, _, _ := joinFixture(t, s)
+	if _, _, err := s.JoinAgent(ctx, conn, "a", "one", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.JoinAgent(ctx, conn, "b", "two", 1); !errors.Is(err, ErrAgentLimit) {
+		t.Fatalf("got %v", err)
+	}
+	s.EndSession(ctx, "a")
+	if _, created, err := s.JoinAgent(ctx, conn, "c", "one", 1); err != nil || created {
+		t.Fatalf("reclaim over the limit: %v %v", err, created)
+	}
+}
+
+func TestOAuthCodeWorksOnce(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	_, u, ws := joinFixture(t, s)
+	s.CreateOAuthClient(ctx, OAuthClient{ID: "cl", Name: "x", RedirectURIs: []string{"http://localhost/cb"}})
+	code := OAuthCode{ClientID: "cl", UserID: u.ID, WorkspaceID: ws, RedirectURI: "http://localhost/cb", Challenge: "c"}
+	s.CreateOAuthCode(ctx, "good", code, time.Now().Add(time.Minute).UnixMilli())
+	s.CreateOAuthCode(ctx, "late", code, time.Now().Add(-time.Minute).UnixMilli())
+	if _, err := s.ConsumeOAuthCode(ctx, "good"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ConsumeOAuthCode(ctx, "good"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second use: %v", err)
+	}
+	if _, err := s.ConsumeOAuthCode(ctx, "late"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired: %v", err)
+	}
+}
+
+func TestMaintainRetiresIdleChatAgentsOnly(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, u, ws := joinFixture(t, s)
+	idle, _, _ := s.JoinAgent(ctx, conn, "idle", "idle", 0)
+	fresh, _, _ := s.JoinAgent(ctx, conn, "fresh", "fresh", 0)
+	manual, _ := s.CreateAgent(ctx, ws, u.ID, "manual", "", "tm")
+	old := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
+	s.w.ExecContext(ctx, `UPDATE agents SET created_at = ?, last_seen_at = ? WHERE id IN (?, ?)`, old, old, idle.ID, manual.ID)
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AgentByID(ctx, ws, idle.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("idle chat agent kept: %v", err)
+	}
+	if _, err := s.AgentByID(ctx, ws, fresh.ID); err != nil {
+		t.Fatalf("active chat agent retired: %v", err)
+	}
+	if _, err := s.AgentByID(ctx, ws, manual.ID); err != nil {
+		t.Fatalf("manually created agent retired: %v", err)
+	}
+}
+
+func TestStandInNameHandsOverWaitingMessages(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, _, ws := joinFixture(t, s)
+	real, _, _ := s.JoinAgent(ctx, conn, "old-chat", "backend", 0)
+	standIn, _, _ := s.JoinAgent(ctx, conn, "new-chat", "backend", 0)
+	if standIn.Name != "backend-2" {
+		t.Fatalf("%+v", standIn)
+	}
+	other, _, _ := s.JoinAgent(ctx, conn, "other", "frontend", 0)
+	s.InsertMessage(ctx, ws, 0, other.ID, standIn.ID, "ask", "sent to the stand-in", 0)
+
+	s.EndSession(ctx, "old-chat")
+	// The new chat now gets the real name, and the stand-in goes away.
+	got, _, err := s.JoinAgent(ctx, conn, "new-chat", "backend", 0)
+	if err != nil || got.ID != real.ID {
+		t.Fatalf("%v %+v", err, got)
+	}
+	if err := s.RetireChatAgent(ctx, standIn, got); err != nil {
+		t.Fatal(err)
+	}
+	unread, _ := s.Unread(ctx, real.ID, 10)
+	if len(unread) != 1 || unread[0].Body != "sent to the stand-in" {
+		t.Fatalf("message did not move: %+v", unread)
+	}
+	if _, err := s.AgentByID(ctx, ws, standIn.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stand-in still listed: %v", err)
+	}
+}
+
+func TestStandInIsKeptWhileAnotherChatUsesIt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	conn, _, ws := joinFixture(t, s)
+	real, _, _ := s.JoinAgent(ctx, conn, "a", "backend", 0)
+	standIn, _, _ := s.JoinAgent(ctx, conn, "b", "backend", 0)
+	if err := s.RetireChatAgent(ctx, standIn, real); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AgentByID(ctx, ws, standIn.ID); err != nil {
+		t.Fatalf("removed a name a chat is still using: %v", err)
+	}
+}

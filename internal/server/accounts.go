@@ -322,6 +322,9 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, c *m
 		s.internalError(w, r, err)
 		return
 	}
+	if err := s.store.DeleteMemberConnections(r.Context(), c.WorkspaceID, target); err != nil {
+		s.log.Warn("delete member connections", "err", err)
+	}
 	for i := range agents {
 		if agents[i].UserID == target {
 			s.hub.Kick(c.WorkspaceID, agents[i].ID)

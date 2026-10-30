@@ -110,3 +110,16 @@ func (s *Server) pruneDemo(ctx context.Context) {
 		s.log.Info("pruned demo data", "workspaces", workspaces, "users", users)
 	}
 }
+
+// maxChatAgents keeps a runaway client from filling a workspace with chats.
+const maxChatAgents = 200
+
+// agentLimit is how many agents a workspace can reach through chats joining.
+func (s *Server) agentLimit(ctx context.Context, workspaceID int64) int {
+	if s.cfg.Demo {
+		if demo, err := s.store.IsDemoWorkspace(ctx, workspaceID); err == nil && demo {
+			return demoMaxAgents
+		}
+	}
+	return maxChatAgents
+}

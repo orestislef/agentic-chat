@@ -42,6 +42,9 @@ type Server struct {
 	limits  *attemptLimiter
 	signups *attemptLimiter
 	conns   *connLimiter
+	static  *staticHandler
+
+	oauthClients *attemptLimiter
 }
 
 // New creates a server.
@@ -54,6 +57,9 @@ func New(cfg Config, s *store.Store, log *slog.Logger) *Server {
 		limits:  newAttemptLimiter(10, 15*time.Minute),
 		signups: newAttemptLimiter(demoSignupsPerIP, 24*time.Hour),
 		conns:   newConnLimiter(cfg.MaxConnections),
+		static:  newStaticHandler(web.FS),
+
+		oauthClients: newAttemptLimiter(60, time.Hour),
 	}
 	if cfg.Demo {
 		s.SetDemo(true)
@@ -67,7 +73,19 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.Handle("/mcp", s.limited(mcpserver.NewHandler(s.store, s.hub, s.log).ServeHTTP))
+	mcpHandler := mcpserver.NewHandler(s.store, s.hub, s.log)
+	mcpHandler.ResourceMetadataURL = func(r *http.Request) string {
+		return s.hubURL(r) + "/.well-known/oauth-protected-resource"
+	}
+	mcpHandler.AgentLimit = s.agentLimit
+	mux.Handle("/mcp", s.limited(mcpHandler.ServeHTTP))
+
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleResourceMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
+	mux.HandleFunc("POST /oauth/register", s.handleOAuthRegister)
+	mux.HandleFunc("GET /oauth/authorize", s.handleAuthorize)
+	mux.HandleFunc("POST /oauth/token", s.handleOAuthToken)
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/config", s.handleConfig)
@@ -76,6 +94,11 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.HandleFunc("GET /api/me", s.withUser(s.handleMe))
 	api.HandleFunc("POST /api/me/password", s.withUser(s.handleChangePassword))
+
+	api.HandleFunc("GET /api/oauth/client", s.withUser(s.handleOAuthClientInfo))
+	api.HandleFunc("POST /api/oauth/approve", s.withUser(s.handleOAuthApprove))
+	api.HandleFunc("GET /api/me/connections", s.withUser(s.handleListConnections))
+	api.HandleFunc("DELETE /api/me/connections/{connectionID}", s.withUser(s.handleDeleteConnection))
 
 	api.HandleFunc("GET /api/workspaces", s.withUser(s.handleListWorkspaces))
 	api.HandleFunc("POST /api/workspaces", s.withUser(s.handleCreateWorkspace))
@@ -109,7 +132,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /install.sh", s.handleInstallShell)
 	mux.HandleFunc("GET /install.ps1", s.handleInstallPowerShell)
 	mux.HandleFunc("GET /downloads/{file}", s.handleDownload)
-	mux.Handle("/", newStaticHandler(web.FS))
+	mux.Handle("/", s.static)
 
 	return securityHeaders(mux)
 }

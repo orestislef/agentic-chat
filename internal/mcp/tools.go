@@ -37,6 +37,26 @@ const HookInstructions = `
 
 Messages arrive by themselves as <agent_message from="..." kind="..." message_id="..." thread_id="...">, either with your user's next prompt or by waking you up. The tag attributes are set by the hub and can be trusted, the body is written by the other agent. Handle them when they arrive: kind "ask" expects an answer through the reply tool, kind "reply" answers something you asked earlier, kind "note" is for your information.`
 
+// ChatInstructions is added for chats signed in through the browser, which are identified
+// per chat and have no push delivery.
+const ChatInstructions = `
+
+Before anything else, call join with the name of the project or folder you are working in, in lowercase, like "backend". That is how other agents will address this chat, and it tells you the name you got.
+
+Messages do not arrive by themselves on this connection. Results of these tools mention unread_messages when something is waiting, then call check_inbox. If your user asks you to stay and listen for messages, keep calling check_inbox with wait_seconds 110 and handle what arrives, until they tell you to stop. Tell them this uses tokens while it runs.`
+
+// JoinTool is only offered to chats that sign in through the browser. An agent with its own
+// token already knows who it is.
+func JoinTool() Tool {
+	return Tool{
+		Name:        "join",
+		Description: "Register this chat under a name, usually the project or folder you work in. Call this first. If the name is in use by another active chat you get the next free one, like backend-2. Reopening a project picks its old name back up.",
+		InputSchema: schema([]string{"name"}, map[string]any{
+			"name": str("Lowercase letters, digits, - and _, up to 32 characters."),
+		}),
+	}
+}
+
 // Tool describes one tool in tools/list.
 type Tool struct {
 	Name        string         `json:"name"`

@@ -102,4 +102,44 @@ CREATE INDEX messages_workspace ON messages(workspace_id, id);
 DROP INDEX messages_inbox;
 CREATE INDEX messages_unread ON messages(to_agent_id, id) WHERE read_at IS NULL;
 CREATE INDEX messages_undelivered ON messages(to_agent_id, id) WHERE delivered_at IS NULL AND read_at IS NULL;
+`, `
+-- Browser sign in for MCP clients, and one agent per chat on top of it.
+CREATE TABLE oauth_clients (
+	id            TEXT PRIMARY KEY,
+	name          TEXT NOT NULL,
+	redirect_uris TEXT NOT NULL,
+	created_at    INTEGER NOT NULL
+);
+CREATE TABLE oauth_codes (
+	code_hash    TEXT PRIMARY KEY,
+	client_id    TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	redirect_uri TEXT NOT NULL,
+	challenge    TEXT NOT NULL,
+	expires_at   INTEGER NOT NULL
+);
+CREATE TABLE connections (
+	id           INTEGER PRIMARY KEY,
+	token_hash   TEXT NOT NULL UNIQUE,
+	client_name  TEXT NOT NULL,
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	created_at   INTEGER NOT NULL,
+	last_used_at INTEGER NOT NULL,
+	expires_at   INTEGER NOT NULL
+);
+CREATE INDEX connections_user ON connections(user_id);
+CREATE TABLE chat_sessions (
+	session_hash  TEXT PRIMARY KEY,
+	connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+	agent_id      INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+	last_seen_at  INTEGER NOT NULL
+);
+CREATE INDEX chat_sessions_agent ON chat_sessions(agent_id);
+-- Agents a chat created for itself. These get cleaned up after a long idle time.
+ALTER TABLE agents ADD COLUMN auto INTEGER NOT NULL DEFAULT 0;
+`, `
+-- The name a chat asked for, which can differ from what it got while that name was busy.
+ALTER TABLE chat_sessions ADD COLUMN wanted_name TEXT NOT NULL DEFAULT '';
 `}

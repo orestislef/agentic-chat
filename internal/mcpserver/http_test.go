@@ -277,3 +277,23 @@ func TestDatabaseFailureIsNotReportedAsBadToken(t *testing.T) {
 		t.Fatalf("status %d: a client treats 401 as revoked and gives up for good", resp.StatusCode)
 	}
 }
+
+func TestCleanName(t *testing.T) {
+	cases := map[string]string{
+		"backend":               "backend",
+		"My Project":            "my-project",
+		"  --Foo.Bar--  ":       "foo-bar",
+		"agentic_chat":          "agentic_chat",
+		"!!!":                   "",
+		"":                      "",
+		strings.Repeat("a", 50): strings.Repeat("a", 32),
+	}
+	for in, want := range cases {
+		if got := CleanName(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+		if got := CleanName(in); got != "" && !hub.ValidName(got) {
+			t.Errorf("%q gives an invalid name %q", in, got)
+		}
+	}
+}

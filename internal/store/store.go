@@ -234,6 +234,15 @@ func (s *Store) Maintain(ctx context.Context) error {
 	}{
 		{`DELETE FROM sessions WHERE expires_at <= ?`, []any{now}},
 		{`DELETE FROM invites WHERE expires_at <= ? OR uses >= max_uses`, []any{now}},
+		{`DELETE FROM oauth_codes WHERE expires_at <= ?`, []any{now}},
+		{`DELETE FROM connections WHERE expires_at <= ?`, []any{now}},
+		// Every client registers itself anew, the ones that never finished signing in pile up.
+		{`DELETE FROM oauth_clients WHERE created_at < ?
+			AND NOT EXISTS (SELECT 1 FROM oauth_codes WHERE client_id = oauth_clients.id)`, []any{now - 24*60*60*1000}},
+		{`DELETE FROM chat_sessions WHERE last_seen_at < ?`, []any{now - 90*24*60*60*1000}},
+		// A chat's agent that nobody used for a month goes away. Opening that project again makes a new one.
+		{`UPDATE agents SET revoked_at = ?, token_hash = NULL WHERE auto = 1 AND revoked_at IS NULL
+			AND COALESCE(last_seen_at, created_at) < ?`, []any{now, now - 30*24*60*60*1000}},
 		// Retry keys only matter for minutes, a day is generous.
 		{`UPDATE messages SET client_key = NULL WHERE client_key IS NOT NULL AND created_at < ?`, []any{now - 24*60*60*1000}},
 		// A revoked agent stays while history still names it, then it can go.

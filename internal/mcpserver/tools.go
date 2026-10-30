@@ -158,7 +158,7 @@ func (t *toolbox) awaitReply(ctx context.Context, a *store.Agent, messageID, thr
 	if reply == nil {
 		return map[string]any{
 			"status": "pending", "message_id": messageID, "thread_id": threadID,
-			"note": "No answer yet. Carry on with your work. The answer arrives by itself if this session has push delivery, otherwise call wait_for_reply or check_inbox later.",
+			"note": "No answer yet. Carry on with your work and look again later with wait_for_reply or check_inbox, unless your instructions say messages reach you by themselves.",
 		}, nil
 	}
 	return map[string]any{"status": "answered", "reply": view(reply)}, nil
