@@ -852,3 +852,86 @@ func TestStaticFilesCompressedAndRevalidated(t *testing.T) {
 		t.Fatalf("font: %d %v", font.StatusCode, font.Header)
 	}
 }
+
+func TestDeleteWorkspaceRemovesEverythingInItOnly(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	keep := owner.workspaceID()
+	var extra store.Workspace
+	owner.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "throwaway"}, http.StatusCreated, &extra)
+	ws := strconv.FormatInt(extra.ID, 10)
+
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 2}, http.StatusCreated, &created)
+	member := ts.register("member", created.Code)
+
+	_, token := owner.createAgent(ws, "doomed")
+	_, keepToken := owner.createAgent(keep, "stays")
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "doomed", "body": "vanishing words"}, http.StatusCreated, nil)
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+keep+"/messages", map[string]string{"to": "stays", "body": "lasting words"}, http.StatusCreated, nil)
+	chat := signIn(t, ts, owner, ws)
+	conn := dialAgent(t, ts, token)
+	time.Sleep(50 * time.Millisecond)
+
+	// A member cannot delete it, and neither can someone with no workspace left afterwards.
+	if status, _ := member.do(http.MethodDelete, "/api/workspaces/"+ws, nil); status != http.StatusForbidden {
+		t.Fatalf("member: %d", status)
+	}
+	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws, nil, http.StatusNoContent, nil)
+
+	// The open connection ends with the code that tells the client to stop.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var readErr error
+	for readErr == nil {
+		_, _, readErr = conn.Read(ctx)
+	}
+	if websocket.CloseStatus(readErr) != closeRevoked {
+		t.Fatalf("open connection: %v", readErr)
+	}
+
+	bearer := func(tok, method, path string) int {
+		req, _ := http.NewRequest(method, ts.url+path, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if status := bearer(token, http.MethodGet, "/api/agent/me"); status != http.StatusUnauthorized {
+		t.Fatalf("agent token after delete: %d", status)
+	}
+	if status := bearer(chat, http.MethodPost, "/mcp"); status != http.StatusUnauthorized {
+		t.Fatalf("signed in client after delete: %d", status)
+	}
+	if status, _ := owner.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusNotFound {
+		t.Fatalf("messages after delete: %d", status)
+	}
+
+	// The other workspace is untouched, and its search does not find the deleted words.
+	if status := bearer(keepToken, http.MethodGet, "/api/agent/me"); status != http.StatusOK {
+		t.Fatalf("other workspace's agent: %d", status)
+	}
+	var hits []store.Message
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+keep+"/messages?q=words", nil, http.StatusOK, &hits)
+	if len(hits) != 1 || hits[0].Body != "lasting words" {
+		t.Fatalf("search: %+v", hits)
+	}
+	// The member's account survives, only that workspace is gone for them.
+	if status, _ := member.do(http.MethodGet, "/api/me", nil); status != http.StatusOK {
+		t.Fatalf("member account: %d", status)
+	}
+}
+
+func TestLastWorkspaceCannotBeDeleted(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	status, body := owner.do(http.MethodDelete, "/api/workspaces/"+owner.workspaceID(), nil)
+	if status != http.StatusConflict || !strings.Contains(string(body), "only workspace") {
+		t.Fatalf("%d %s", status, body)
+	}
+}

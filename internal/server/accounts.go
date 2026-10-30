@@ -259,6 +259,35 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request, u
 	writeJSON(w, http.StatusCreated, created)
 }
 
+// handleDeleteWorkspace removes a workspace for everyone in it. An account keeps at least one,
+// because without any there is nothing to connect a client to.
+func (s *Server) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request, c *memberContext) {
+	mine, err := s.store.WorkspacesForUser(r.Context(), c.User.ID)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	if len(mine) <= 1 {
+		writeError(w, http.StatusConflict, "this is your only workspace, create another one before deleting it")
+		return
+	}
+	agents, err := s.store.Agents(r.Context(), c.WorkspaceID)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	if err := s.store.DeleteWorkspace(r.Context(), c.WorkspaceID); err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	// Everything still open on it has to end now, the rows it depends on are gone.
+	for i := range agents {
+		s.hub.Kick(c.WorkspaceID, agents[i].ID)
+	}
+	s.log.Info("workspace deleted", "workspace", c.WorkspaceID, "by", c.User.Username)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleAcceptInvite(w http.ResponseWriter, r *http.Request, u *store.User) {
 	var in struct {
 		Code string `json:"code"`

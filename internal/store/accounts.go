@@ -392,3 +392,15 @@ func redeemInvite(ctx context.Context, tx *sql.Tx, codeHash string, userID int64
 func isUniqueErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
+
+// DeleteWorkspace removes a workspace with its agents, messages, invites and signed in clients.
+func (s *Store) DeleteWorkspace(ctx context.Context, workspaceID int64) error {
+	res, err := s.w.ExecContext(ctx, `DELETE FROM workspaces WHERE id = ?`, workspaceID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

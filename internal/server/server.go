@@ -104,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/workspaces", s.withUser(s.handleCreateWorkspace))
 	api.HandleFunc("POST /api/invites/accept", s.withUser(s.handleAcceptInvite))
 
+	api.HandleFunc("DELETE /api/workspaces/{id}", s.withOwner(s.handleDeleteWorkspace))
 	api.HandleFunc("GET /api/workspaces/{id}/members", s.withMember(s.handleListMembers))
 	api.HandleFunc("DELETE /api/workspaces/{id}/members/{userID}", s.withMember(s.handleRemoveMember))
 	api.HandleFunc("GET /api/workspaces/{id}/invites", s.withOwner(s.handleListInvites))
