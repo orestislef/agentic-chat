@@ -38,6 +38,10 @@ var (
 	ErrNotRecipient  = errors.New("you can only reply to messages addressed to you")
 	ErrNotSender     = errors.New("you can only wait for replies to messages you sent")
 	ErrRateLimited   = errors.New("too many messages, wait a minute before sending more")
+	ErrLimitReached  = errors.New("limit reached")
+
+	// ErrWatcherReplaced tells a background watcher that a newer one took over and it should exit.
+	ErrWatcherReplaced = errors.New("replaced by a newer watcher")
 )
 
 // Limits protects the hub and keeps two agents from talking in circles forever.
@@ -194,7 +198,7 @@ func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string
 		return nil, ErrEmptyBody
 	}
 	if len(body) > h.limits.MaxMessageBytes {
-		return nil, fmt.Errorf("message is %d bytes, the limit is %d, send a shorter summary", len(body), h.limits.MaxMessageBytes)
+		return nil, fmt.Errorf("%w: message is %d bytes, the limit is %d, send a shorter summary", ErrLimitReached, len(body), h.limits.MaxMessageBytes)
 	}
 	if from.ID == to.ID {
 		return nil, ErrSelfMessage
@@ -208,7 +212,7 @@ func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string
 			return nil, ErrUnknownThread
 		}
 		if n >= h.limits.MaxThreadMessages {
-			return nil, fmt.Errorf("thread %d reached its limit of %d messages, stop here and check with your user before continuing", threadID, h.limits.MaxThreadMessages)
+			return nil, fmt.Errorf("%w: thread %d has %d messages, stop here and check with your user before continuing", ErrLimitReached, threadID, h.limits.MaxThreadMessages)
 		}
 	}
 	if !h.allow(from.ID) {
@@ -514,7 +518,7 @@ func (h *Hub) Inbox(ctx context.Context, a *store.Agent, limit int, wait time.Du
 		select {
 		case <-w.wake:
 		case <-w.cancel:
-			return []store.Message{}, nil
+			return nil, ErrWatcherReplaced
 		case <-timer.C:
 			return []store.Message{}, nil
 		case <-ctx.Done():

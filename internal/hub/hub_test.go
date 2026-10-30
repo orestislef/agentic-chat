@@ -297,10 +297,10 @@ func TestInboxWaitWakesOnMessage(t *testing.T) {
 func TestExclusiveWatcherReplacesOlderOne(t *testing.T) {
 	e := setup(t, DefaultLimits())
 	ctx := context.Background()
-	older := make(chan []store.Message, 1)
+	older := make(chan error, 1)
 	go func() {
-		msgs, _ := e.hub.Inbox(ctx, e.backend, 10, 5*time.Second, true)
-		older <- msgs
+		_, err := e.hub.Inbox(ctx, e.backend, 10, 5*time.Second, true)
+		older <- err
 	}()
 	time.Sleep(30 * time.Millisecond)
 	newer := make(chan []store.Message, 1)
@@ -309,9 +309,9 @@ func TestExclusiveWatcherReplacesOlderOne(t *testing.T) {
 		newer <- msgs
 	}()
 	select {
-	case msgs := <-older:
-		if len(msgs) != 0 {
-			t.Fatalf("older watcher took messages: %+v", msgs)
+	case err := <-older:
+		if !errors.Is(err, ErrWatcherReplaced) {
+			t.Fatalf("older watcher should be told it was replaced, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("older watcher was not replaced")
