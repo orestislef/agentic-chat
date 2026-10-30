@@ -67,6 +67,9 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request, c *me
 		writeError(w, http.StatusBadRequest, "description is too long")
 		return
 	}
+	if s.demoAgentRefused(w, r, c.WorkspaceID) {
+		return
+	}
 	token, err := auth.NewToken("ac")
 	if err != nil {
 		s.internalError(w, r, err)

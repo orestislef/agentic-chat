@@ -31,13 +31,23 @@ const MaxPasswordLength = 256
 
 var b64 = base64.RawStdEncoding
 
+// hashSlots caps how many password hashes run at once. Each one takes 19 MiB, so a burst
+// of logins waits in line instead of running the hub out of memory.
+var hashSlots = make(chan struct{}, 4)
+
+func deriveKey(password string, salt []byte, time, memory uint32, threads uint8, keyLen uint32) []byte {
+	hashSlots <- struct{}{}
+	defer func() { <-hashSlots }()
+	return argon2.IDKey([]byte(password), salt, time, memory, threads, keyLen)
+}
+
 // HashPassword returns an encoded argon2id hash with a random salt.
 func HashPassword(password string) (string, error) {
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	key := deriveKey(password, salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version, argonMemory, argonTime, argonThreads, b64.EncodeToString(salt), b64.EncodeToString(key)), nil
 }
@@ -61,14 +71,14 @@ func VerifyPassword(encoded, password string) bool {
 	if err != nil {
 		return false
 	}
-	got := argon2.IDKey([]byte(password), salt, time, memory, threads, uint32(len(want)))
+	got := deriveKey(password, salt, time, memory, threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
 // DummyVerify burns the same time as a real check, so a login for an unknown
 // username takes as long as one for a real account.
 func DummyVerify(password string) {
-	argon2.IDKey([]byte(password), make([]byte, argonSaltLen), argonTime, argonMemory, argonThreads, argonKeyLen)
+	deriveKey(password, make([]byte, argonSaltLen), argonTime, argonMemory, argonThreads, argonKeyLen)
 }
 
 // NewToken returns a random token with a readable prefix, for example ac_...

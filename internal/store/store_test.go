@@ -408,3 +408,63 @@ func TestPruneInBatchesAndReclaimsSpace(t *testing.T) {
 		t.Fatalf("disk space not given back: %d pages before, %d after", before, after)
 	}
 }
+
+func TestDemoPruneOnlyTouchesDemoRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Everything from before the flag: the admin, a colleague and their workspaces.
+	admin, _ := s.CreateAccount(ctx, "admin", "h", "", "admin space")
+	before, _ := s.CreateAccount(ctx, "colleague", "h", "", "colleague space")
+	beforeWs, _ := s.WorkspacesForUser(ctx, before.ID)
+	a, _ := s.CreateAgent(ctx, beforeWs[0].ID, before.ID, "keep", "", "t1")
+	b, _ := s.CreateAgent(ctx, beforeWs[0].ID, before.ID, "keep2", "", "t2")
+	s.InsertMessage(ctx, beforeWs[0].ID, 0, a.ID, b.ID, "note", "real words", 0)
+
+	s.SetDemo(true)
+	visitor, err := s.CreateAccount(ctx, "visitor", "h", "", "visitor space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vw, _ := s.WorkspacesForUser(ctx, visitor.ID)
+	if !vw[0].Demo {
+		t.Fatal("workspace created under demo mode is not marked")
+	}
+	x, _ := s.CreateAgent(ctx, vw[0].ID, visitor.ID, "x", "", "t3")
+	y, _ := s.CreateAgent(ctx, vw[0].ID, visitor.ID, "y", "", "t4")
+	s.InsertMessage(ctx, vw[0].ID, 0, x.ID, y.ID, "note", "throwaway words", 0)
+
+	// Admins stay exempt, also for what they create while the flag is on.
+	adminExtra, err := s.CreateWorkspace(ctx, "second", admin)
+	if err != nil || adminExtra.Demo {
+		t.Fatalf("admin workspace marked as demo: %v %+v", err, adminExtra)
+	}
+
+	wiped, users, err := s.PruneDemo(ctx, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wiped != 1 || users != 1 {
+		t.Fatalf("wiped %d workspaces and %d users", wiped, users)
+	}
+	if _, err := s.UserByUsername(ctx, "visitor"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("visitor still there: %v", err)
+	}
+	for _, name := range []string{"admin", "colleague"} {
+		if _, err := s.UserByUsername(ctx, name); err != nil {
+			t.Fatalf("%s was deleted: %v", name, err)
+		}
+	}
+	if hits, _ := s.Search(ctx, beforeWs[0].ID, "real", 10); len(hits) != 1 {
+		t.Fatalf("existing history was touched: %+v", hits)
+	}
+	// The search index must not keep what was deleted.
+	var left int
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'throwaway'`).Scan(&left)
+	if left != 0 {
+		t.Fatal("search index still holds deleted demo messages")
+	}
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

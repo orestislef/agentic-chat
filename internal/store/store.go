@@ -21,7 +21,13 @@ var ErrConflict = errors.New("already exists")
 
 // Store wraps the database handle.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	demo bool
+}
+
+// SetDemo marks everything created from now on as demo data, except for admins.
+func (s *Store) SetDemo(on bool) {
+	s.demo = on
 }
 
 // Open opens or creates the database at path and applies pending migrations.

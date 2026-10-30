@@ -625,3 +625,98 @@ func TestRemovingAMemberRevokesTheirAgents(t *testing.T) {
 		t.Fatalf("agent of a removed member still works: %d", resp.StatusCode)
 	}
 }
+
+func TestDemoModeLimitsNewcomersOnly(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "demo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	serve := func(demo bool) *testServer {
+		cfg := Config{DataDir: dir, DownloadsDir: dir, Registration: RegistrationOpen, Limits: hub.DefaultLimits(), Demo: demo}
+		s.SetDemo(false)
+		srv := httptest.NewServer(New(cfg, s, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+		t.Cleanup(srv.Close)
+		return &testServer{t: t, url: srv.URL}
+	}
+
+	// The hub is in use before the flag goes on.
+	before := serve(false)
+	admin := before.register("admin", "")
+	colleague := before.register("colleague", "")
+	colleagueWs := colleague.workspaceID()
+
+	ts := serve(true)
+	var config map[string]any
+	ts.newClient().mustJSON(http.MethodGet, "/api/config", nil, http.StatusOK, &config)
+	if config["demo"] != true {
+		t.Fatalf("config: %v", config)
+	}
+
+	visitor := ts.register("visitor", "")
+	ws := visitor.workspaceID()
+	var list []store.Workspace
+	visitor.mustJSON(http.MethodGet, "/api/workspaces", nil, http.StatusOK, &list)
+	if !list[0].Demo {
+		t.Fatal("new workspace not marked as demo")
+	}
+
+	// A second workspace and a fourth agent are refused, with a reason.
+	if status, body := visitor.do(http.MethodPost, "/api/workspaces", map[string]string{"name": "more"}); status != http.StatusForbidden || !strings.Contains(string(body), "one workspace") {
+		t.Fatalf("second workspace: %d %s", status, body)
+	}
+	for _, name := range []string{"a1", "a2", "a3"} {
+		visitor.createAgent(ws, name)
+	}
+	if status, body := visitor.do(http.MethodPost, "/api/workspaces/"+ws+"/agents", map[string]string{"name": "a4"}); status != http.StatusForbidden || !strings.Contains(string(body), "at most") {
+		t.Fatalf("fourth agent: %d %s", status, body)
+	}
+
+	// Messages are capped in size, and the reason says how to get rid of the limit.
+	big := strings.Repeat("x", demoMaxMessageBytes+1)
+	if status, body := visitor.do(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "a1", "body": big}); status != http.StatusBadRequest || !strings.Contains(string(body), "host your own hub") {
+		t.Fatalf("big message: %d %s", status, body)
+	}
+	visitor.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "a1", "body": "small"}, http.StatusCreated, nil)
+
+	// Whoever was here before the flag has no limits, and neither do admins.
+	colleague2 := ts.newClient()
+	colleague2.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "colleague", "password": password}, http.StatusOK, nil)
+	for _, name := range []string{"b1", "b2", "b3", "b4"} {
+		colleague2.createAgent(colleagueWs, name)
+	}
+	colleague2.mustJSON(http.MethodPost, "/api/workspaces/"+colleagueWs+"/messages", map[string]string{"to": "b1", "body": big}, http.StatusCreated, nil)
+	admin2 := ts.newClient()
+	admin2.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "admin", "password": password}, http.StatusOK, nil)
+	admin2.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "extra"}, http.StatusCreated, nil)
+	_ = admin
+}
+
+func TestDemoCapsSignupsPerAddress(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen; c.Demo = true })
+	ts.register("first", "")
+	for i := 0; i < demoSignupsPerIP; i++ {
+		ts.register("user"+strconv.Itoa(i), "")
+	}
+	status, _ := ts.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "onemore", "password": password})
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status %d", status)
+	}
+}
+
+func TestDemoOffChangesNothing(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
+	ts.register("first", "")
+	u := ts.register("second", "")
+	ws := u.workspaceID()
+	var list []store.Workspace
+	u.mustJSON(http.MethodGet, "/api/workspaces", nil, http.StatusOK, &list)
+	if list[0].Demo {
+		t.Fatal("marked as demo with the flag off")
+	}
+	for i := 0; i < demoMaxAgents+2; i++ {
+		u.createAgent(ws, "agent"+strconv.Itoa(i))
+	}
+	u.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "another"}, http.StatusCreated, nil)
+}

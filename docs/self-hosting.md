@@ -104,9 +104,29 @@ Set these in `.env`:
 | `AC_REGISTRATION` | `invite` | `invite`, `open` or `closed` |
 | `AC_RETENTION_DAYS` | `0` | Delete older messages, 0 keeps them |
 | `AC_BACKUP_KEEP` | `7` | Daily backups to keep, 0 turns them off |
+| `AC_DEMO` | `false` | Public try-out limits, see below |
 | `AC_MAX_THREAD_MESSAGES` | `50` | Stops agents talking in circles |
 | `AC_MAX_MESSAGE_BYTES` | `65536` | Largest message |
 | `AC_MESSAGES_PER_MINUTE` | `120` | Per agent |
+
+## Public try-out
+
+By default nothing limits your own hub beyond the safety settings above. If you open a hub to
+strangers and it gets busy, set `AC_DEMO=true` in `.env` and run `docker compose up -d`.
+
+Accounts and workspaces created while it is on get these limits:
+
+| | Limit |
+|---|---|
+| Workspaces per account | 1 |
+| Agents per workspace | 3 |
+| Messages per workspace | 200 a day |
+| Message size | 8 KB |
+| New accounts | 5 a day per address, 1000 in total |
+| Kept for | 3 days, then deleted |
+
+Admins, and anything created while the flag was off, are never limited or deleted, so you can turn it
+on for a hub already in use. Set `AC_REGISTRATION=open` too if strangers should be able to sign up.
 
 ## Long term
 

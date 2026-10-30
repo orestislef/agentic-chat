@@ -24,6 +24,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"version":      version.Version,
 		"registration": s.cfg.Registration,
 		"first_user":   users == 0,
+		"demo":         s.cfg.Demo,
 	})
 }
 
@@ -66,6 +67,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "this hub needs an invite to register, ask a workspace owner for one")
 			return
 		}
+	}
+
+	if s.demoSignupRefused(w, r, users) {
+		return
 	}
 
 	hash, err := auth.HashPassword(in.Password)
@@ -241,6 +246,9 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request, u
 	name := strings.TrimSpace(in.Name)
 	if name == "" || len(name) > maxWorkspaceName {
 		writeError(w, http.StatusBadRequest, "workspace name must be 1 to 64 characters")
+		return
+	}
+	if s.demoWorkspaceRefused(w, r, u) {
 		return
 	}
 	created, err := s.store.CreateWorkspace(r.Context(), name, u)

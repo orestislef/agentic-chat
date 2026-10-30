@@ -118,6 +118,7 @@ type Hub struct {
 	store  *store.Store
 	limits Limits
 	log    *slog.Logger
+	quota  func(ctx context.Context, workspaceID int64, bodyLen int) error
 
 	mu           sync.Mutex
 	conns        map[int64]*Conn
@@ -143,6 +144,11 @@ func New(s *store.Store, limits Limits, log *slog.Logger) *Hub {
 		inboxWaiters: map[int64]map[*inboxWaiter]struct{}{},
 		rates:        map[int64]*rateWindow{},
 	}
+}
+
+// SetQuota installs an extra check that runs before a message is stored.
+func (h *Hub) SetQuota(quota func(ctx context.Context, workspaceID int64, bodyLen int) error) {
+	h.quota = quota
 }
 
 // State returns the presence of an agent.
@@ -235,6 +241,11 @@ func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string
 	}
 	if !h.allow(from.ID) {
 		return nil, ErrRateLimited
+	}
+	if h.quota != nil {
+		if err := h.quota(ctx, from.WorkspaceID, len(body)); err != nil {
+			return nil, err
+		}
 	}
 	m, created, err := h.store.InsertMessageKeyed(ctx, from.WorkspaceID, threadID, from.ID, to.ID, kind, body, inReplyTo, idempotencyKey(ctx))
 	if err != nil {

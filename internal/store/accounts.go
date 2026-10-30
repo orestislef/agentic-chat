@@ -22,6 +22,7 @@ type Workspace struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
 	Role      string `json:"role,omitempty"`
+	Demo      bool   `json:"demo,omitempty"`
 	CreatedAt int64  `json:"created_at"`
 }
 
@@ -67,9 +68,10 @@ func (s *Store) CreateAccount(ctx context.Context, username, passwordHash, invit
 	}
 	now := nowMillis()
 	u := &User{Username: username, IsAdmin: existing == 0, CreatedAt: now}
+	demo := s.demo && !u.IsAdmin
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)`,
-		username, passwordHash, u.IsAdmin, now)
+		`INSERT INTO users (username, password_hash, is_admin, created_at, demo) VALUES (?, ?, ?, ?, ?)`,
+		username, passwordHash, u.IsAdmin, now, demo)
 	if err != nil {
 		if isUniqueErr(err) {
 			return nil, ErrConflict
@@ -85,7 +87,7 @@ func (s *Store) CreateAccount(ctx context.Context, username, passwordHash, invit
 			return nil, err
 		}
 	} else {
-		if _, err := createWorkspace(ctx, tx, workspaceName, u.ID, username); err != nil {
+		if _, err := createWorkspace(ctx, tx, workspaceName, u.ID, username, demo); err != nil {
 			return nil, err
 		}
 	}
@@ -158,16 +160,16 @@ func (s *Store) CreateWorkspace(ctx context.Context, name string, user *User) (*
 		return nil, err
 	}
 	defer tx.Rollback()
-	w, err := createWorkspace(ctx, tx, name, user.ID, user.Username)
+	w, err := createWorkspace(ctx, tx, name, user.ID, user.Username, s.demo && !user.IsAdmin)
 	if err != nil {
 		return nil, err
 	}
 	return w, tx.Commit()
 }
 
-func createWorkspace(ctx context.Context, tx *sql.Tx, name string, userID int64, username string) (*Workspace, error) {
+func createWorkspace(ctx context.Context, tx *sql.Tx, name string, userID int64, username string, demo bool) (*Workspace, error) {
 	now := nowMillis()
-	res, err := tx.ExecContext(ctx, `INSERT INTO workspaces (name, created_at) VALUES (?, ?)`, name, now)
+	res, err := tx.ExecContext(ctx, `INSERT INTO workspaces (name, created_at, demo) VALUES (?, ?, ?)`, name, now, demo)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +180,7 @@ func createWorkspace(ctx context.Context, tx *sql.Tx, name string, userID int64,
 	if err := addMember(ctx, tx, id, userID, username, "owner"); err != nil {
 		return nil, err
 	}
-	return &Workspace{ID: id, Name: name, Role: "owner", CreatedAt: now}, nil
+	return &Workspace{ID: id, Name: name, Role: "owner", Demo: demo, CreatedAt: now}, nil
 }
 
 // addMember adds the membership and the human agent row that represents the
@@ -215,7 +217,7 @@ func addMember(ctx context.Context, tx *sql.Tx, workspaceID, userID int64, usern
 // WorkspacesForUser lists the workspaces a user belongs to.
 func (s *Store) WorkspacesForUser(ctx context.Context, userID int64) ([]Workspace, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT w.id, w.name, m.role, w.created_at
+		SELECT w.id, w.name, m.role, w.demo, w.created_at
 		FROM workspaces w JOIN memberships m ON m.workspace_id = w.id
 		WHERE m.user_id = ? ORDER BY w.created_at`, userID)
 	if err != nil {
@@ -225,7 +227,7 @@ func (s *Store) WorkspacesForUser(ctx context.Context, userID int64) ([]Workspac
 	out := []Workspace{}
 	for rows.Next() {
 		var w Workspace
-		if err := rows.Scan(&w.ID, &w.Name, &w.Role, &w.CreatedAt); err != nil {
+		if err := rows.Scan(&w.ID, &w.Name, &w.Role, &w.Demo, &w.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

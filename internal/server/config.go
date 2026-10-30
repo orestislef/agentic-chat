@@ -26,6 +26,7 @@ type Config struct {
 	RetentionDays int
 	BackupKeep    int
 	TrustProxy    bool
+	Demo          bool
 	Limits        hub.Limits
 }
 
@@ -74,13 +75,23 @@ func ConfigFromEnv() (Config, error) {
 	if c.Limits.MaxMessageBytes > maxMessageBytesCap {
 		return c, fmt.Errorf("AC_MAX_MESSAGE_BYTES can be at most %d", maxMessageBytesCap)
 	}
-	raw := os.Getenv("AC_TRUST_PROXY")
-	if raw != "" {
-		trust, err := strconv.ParseBool(raw)
-		if err != nil {
-			return c, fmt.Errorf("AC_TRUST_PROXY must be true or false, got %q", raw)
+	bools := []struct {
+		name string
+		dest *bool
+	}{
+		{"AC_TRUST_PROXY", &c.TrustProxy},
+		{"AC_DEMO", &c.Demo},
+	}
+	for _, v := range bools {
+		raw := os.Getenv(v.name)
+		if raw == "" {
+			continue
 		}
-		c.TrustProxy = trust
+		on, err := strconv.ParseBool(raw)
+		if err != nil {
+			return c, fmt.Errorf("%s must be true or false, got %q", v.name, raw)
+		}
+		*v.dest = on
 	}
 	return c, nil
 }

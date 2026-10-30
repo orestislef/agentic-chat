@@ -34,22 +34,29 @@ const (
 
 // Server holds the shared dependencies of all handlers.
 type Server struct {
-	cfg    Config
-	store  *store.Store
-	hub    *hub.Hub
-	log    *slog.Logger
-	limits *attemptLimiter
+	cfg     Config
+	store   *store.Store
+	hub     *hub.Hub
+	log     *slog.Logger
+	limits  *attemptLimiter
+	signups *attemptLimiter
 }
 
 // New creates a server.
 func New(cfg Config, s *store.Store, log *slog.Logger) *Server {
-	return &Server{
-		cfg:    cfg,
-		store:  s,
-		hub:    hub.New(s, cfg.Limits, log),
-		log:    log,
-		limits: newAttemptLimiter(10, 15*time.Minute),
+	srv := &Server{
+		cfg:     cfg,
+		store:   s,
+		hub:     hub.New(s, cfg.Limits, log),
+		log:     log,
+		limits:  newAttemptLimiter(10, 15*time.Minute),
+		signups: newAttemptLimiter(demoSignupsPerIP, 24*time.Hour),
 	}
+	if cfg.Demo {
+		s.SetDemo(true)
+		srv.hub.SetQuota(srv.demoQuota)
+	}
+	return srv
 }
 
 // Handler builds the route table.
@@ -133,7 +140,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errs := make(chan error, 1)
 	go func() { errs <- srv.ListenAndServe() }()
-	s.log.Info("listening", "addr", s.cfg.Addr, "registration", s.cfg.Registration)
+	s.log.Info("listening", "addr", s.cfg.Addr, "registration", s.cfg.Registration, "demo", s.cfg.Demo)
 
 	select {
 	case err := <-errs:
@@ -158,6 +165,9 @@ func (s *Server) maintenance(ctx context.Context) {
 			} else if n > 0 {
 				s.log.Info("pruned old messages", "count", n)
 			}
+		}
+		if s.cfg.Demo {
+			s.pruneDemo(ctx)
 		}
 		if err := s.store.Maintain(ctx); err != nil && ctx.Err() == nil {
 			s.log.Warn("database maintenance", "err", err)

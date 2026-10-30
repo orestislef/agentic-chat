@@ -90,4 +90,9 @@ END;
 -- Lets a client retry a send after a lost response without creating a duplicate.
 ALTER TABLE messages ADD COLUMN client_key TEXT;
 CREATE UNIQUE INDEX messages_client_key ON messages(from_agent_id, client_key) WHERE client_key IS NOT NULL;
+`, `
+-- Set on what gets created while demo mode is on. Only these rows are ever limited or
+-- deleted by it, so turning it on cannot touch anything that existed before.
+ALTER TABLE users ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workspaces ADD COLUMN demo INTEGER NOT NULL DEFAULT 0;
 `}

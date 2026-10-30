@@ -15,6 +15,7 @@ services:
       AC_RETENTION_DAYS: ${AC_RETENTION_DAYS:-0}
       AC_BACKUP_KEEP: ${AC_BACKUP_KEEP:-7}
       AC_TRUST_PROXY: ${AC_TRUST_PROXY:-false}
+      AC_DEMO: ${AC_DEMO:-false}
     volumes:
       - data:/data
     read_only: true
