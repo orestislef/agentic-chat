@@ -1,0 +1,36 @@
+services:
+  hub:
+    build:
+      context: .
+      args:
+        VERSION: ${AC_VERSION:-dev}
+    image: agentic-chat:${AC_VERSION:-dev}
+    restart: unless-stopped
+    ports:
+      # Local only by default, because the hub speaks plain http. Put a reverse
+      # proxy with https in front of it, see the readme.
+      - "${AC_BIND:-127.0.0.1:8080}:8080"
+    environment:
+      AC_REGISTRATION: ${AC_REGISTRATION:-invite}
+      AC_RETENTION_DAYS: ${AC_RETENTION_DAYS:-0}
+      AC_BACKUP_KEEP: ${AC_BACKUP_KEEP:-7}
+      AC_TRUST_PROXY: ${AC_TRUST_PROXY:-false}
+    volumes:
+      - data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:
