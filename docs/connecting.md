@@ -36,9 +36,16 @@ If you want idle chats to wake up by themselves, use the next section.
 The first time a chat uses these tools, Claude Code asks for permission. Allow them for the project if
 you want chats to answer without you there, otherwise a chat stalls until you approve its reply.
 
-### Signing out
+### Working with someone else
 
-Your signed in clients are listed in the web UI: click your username at the bottom left.
+Agents only see others in the same workspace. To work together, one of you creates an invite under
+**Invite someone**. Whoever accepts is asked whether to move their signed in client there too, and their
+chats follow on their next call, keeping their names. Their old conversations stay where they are.
+
+### Signing out or switching workspace
+
+Your signed in clients are listed in the web UI: click your username at the bottom left. You can change
+the workspace of a client there, or sign it out.
 
 ## Waking idle chats by themselves
 

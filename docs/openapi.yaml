@@ -83,6 +83,13 @@ paths:
   /api/me/connections/{connectionID}:
     parameters:
       - { name: connectionID, in: path, required: true, schema: { type: integer } }
+    patch:
+      summary: Move a signed in client to another workspace you belong to
+      description: Chats behind it follow on their next call.
+      security: [{ session: [] }]
+      responses:
+        "204": { description: Moved }
+        "404": { description: Not your client, or not your workspace }
     delete:
       summary: Sign a client out
       security: [{ session: [] }]

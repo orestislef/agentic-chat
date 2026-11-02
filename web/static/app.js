@@ -269,11 +269,13 @@ async function start() {
     return;
   }
   const invite = inviteFromURL();
+  let joinedWorkspace = null;
   if (invite) {
     try {
       const joined = await api("POST", "/api/invites/accept", { code: invite });
       state.workspaces = await api("GET", "/api/workspaces");
       state.workspaceId = joined.workspace_id;
+      joinedWorkspace = joined.workspace_id;
     } catch (err) {
       alertDialog("Could not join that workspace", err.message);
     }
@@ -283,6 +285,34 @@ async function start() {
   state.workspaceId ||= state.workspaces.find((w) => w.id === saved)?.id || state.workspaces[0]?.id || null;
   renderShell();
   if (state.workspaceId) await openWorkspace(state.workspaceId);
+  if (joinedWorkspace) await offerMove(joinedWorkspace);
+}
+
+// Someone who signed in a client before accepting an invite would otherwise be in the new
+// workspace while their chats stay behind, unable to see anyone there.
+async function offerMove(workspaceId) {
+  const clients = (await api("GET", "/api/me/connections")).filter((c) => c.workspace_id !== workspaceId);
+  if (!clients.length) return;
+  const name = state.workspaces.find((w) => w.id === workspaceId)?.name;
+  const error = h("p", { class: "error", role: "alert" });
+  const dialog = showDialog(h("div", { class: "dlg" },
+    h("h2", {}, `You joined ${name}`),
+    h("p", {}, clients.length === 1
+      ? `Your signed in client is still connected to ${clients[0].workspace}, so your chats cannot see anyone here yet. Move it?`
+      : `Your ${clients.length} signed in clients are still connected to other workspaces, so your chats cannot see anyone here yet. Move them?`),
+    h("p", { class: "note" }, "Your chats follow on their next call and keep their names. Their old conversations stay where they are."),
+    error,
+    h("div", { class: "dlg-actions" },
+      h("button", { class: "btn plain", onclick: () => dialog.close() }, "Not now"),
+      h("button", {
+        class: "btn",
+        onclick: async () => {
+          try {
+            for (const c of clients) await api("PATCH", `/api/me/connections/${c.id}`, { workspace_id: workspaceId });
+            dialog.close();
+          } catch (err) { error.textContent = err.message; }
+        },
+      }, "Move here"))));
 }
 
 const refs = {};
@@ -976,7 +1006,18 @@ function accountDialog() {
     const list = await api("GET", "/api/me/connections");
     connections.replaceChildren(...(list.length ? [h("p", { class: "note" }, "Signed in clients")] : []),
       ...list.map((c) => h("div", {},
-        h("span", {}, `${c.client_name}, ${c.workspace}, used ${formatTime(c.last_used_at)}`),
+        h("span", {}, `${c.client_name}, used ${formatTime(c.last_used_at)}`),
+        state.workspaces.length > 1
+          ? h("select", {
+            class: "client-workspace", "aria-label": `Workspace of ${c.client_name}`,
+            onchange: async (event) => {
+              try {
+                await api("PATCH", `/api/me/connections/${c.id}`, { workspace_id: Number(event.target.value) });
+                await drawConnections();
+              } catch (err) { error.textContent = err.message; }
+            },
+          }, state.workspaces.map((w) => h("option", { value: w.id, selected: w.id === c.workspace_id }, w.name)))
+          : h("span", { class: "note" }, c.workspace),
         h("button", {
           class: "btn plain", type: "button",
           onclick: async () => {
