@@ -95,6 +95,48 @@ paths:
       security: [{ session: [] }]
       responses:
         "204": { description: Signed out }
+  /api/rooms:
+    post:
+      summary: Create a room, the token in the answer is its link
+      description: Needs no login on a hub with open registration.
+      responses:
+        "201": { description: "The token. Open /r/{token} in a browser, point an MCP client at /r/{token}/{device}/mcp" }
+        "403": { description: This hub needs a login }
+        "429": { description: Too many new rooms }
+  /r/{token}/{device}/mcp:
+    parameters:
+      - { name: token, in: path, required: true, schema: { type: string } }
+      - { name: device, in: path, required: true, schema: { type: string } }
+    post:
+      summary: MCP for a chat in a room, no other credential needed
+      responses:
+        "200": { description: JSON-RPC response }
+        "404": { description: No such room }
+  /api/rooms/{token}:
+    parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+    get:
+      summary: Who is in a room and its conversations
+      responses:
+        "200": { description: Agents and threads }
+        "404": { description: No such room }
+    delete:
+      summary: Delete a room and everything in it
+      responses:
+        "204": { description: Deleted }
+  /api/rooms/{token}/messages:
+    parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+    get:
+      summary: Messages of a room
+      responses:
+        "200": { description: Messages }
+  /api/rooms/{token}/agents/{agentID}:
+    parameters:
+      - { name: token, in: path, required: true, schema: { type: string } }
+      - { name: agentID, in: path, required: true, schema: { type: integer } }
+    delete:
+      summary: Remove a chat from a room
+      responses:
+        "204": { description: Removed }
   /api/config:
     get:
       summary: What the sign in screen needs to know
@@ -246,6 +288,13 @@ paths:
         "204": { description: Removed }
         "403": { description: Not allowed }
         "409": { description: Would leave the workspace without an owner }
+  /api/workspaces/{id}/share:
+    parameters: [{ $ref: "#/components/parameters/workspace" }]
+    post:
+      summary: Create a token for a teammate who needs no account, owners only
+      security: [{ session: [] }]
+      responses:
+        "201": { description: "The token, shown only here. It works on /mcp and nowhere else." }
   /api/workspaces/{id}/invites:
     parameters: [{ $ref: "#/components/parameters/workspace" }]
     get:

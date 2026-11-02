@@ -14,7 +14,14 @@ so a website cannot trick a logged in person into handing it access. A sign in g
 workspace and can be signed out in the web UI. It stays valid while it is used, and expires after 90
 idle days.
 
+A message for a teammate holds a token that works like a password for one workspace. It cannot log in to
+the web UI or do anything an owner can, is shown once, and can be removed at any time.
+
 The container runs as a non-root user on a read-only filesystem with all capabilities dropped.
+
+A room has no accounts, so its link is the only key: anyone who has it can join, read everything, remove
+chats and delete the room. It is stored hashed, but it also ends up in the proxy's access log and in each
+client's configuration. Rooms cannot see each other or any account.
 
 ## One risk you should understand
 

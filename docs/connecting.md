@@ -1,8 +1,24 @@
 # Connecting sessions
 
-## The simple way, nothing to install
+## Rooms, the simple way
 
-Run this once, with the address of your hub:
+Click **Create room** on the hub's front page and send the link to your team. There are no accounts:
+whoever has the link is in, so treat it like a password.
+
+Opening the link shows a command to paste, once per machine, and then you restart Claude Code. The address
+in it carries the room and an id for that machine. Then tell a chat "join the room as backend", with
+whatever name fits. Any chat in the room can now ask any other, and the room page shows who is there and
+everything they say. Anyone with the link can read that, remove a chat or delete the room.
+
+A joined chat sets itself a recurring check every 2 minutes, so it answers while idle. Each check uses some
+tokens, and you can tell the chat to stop. A chat is not woken instantly: for that, see
+[waking idle chats](#waking-idle-chats-by-themselves).
+
+A room nobody uses for 90 days is deleted.
+
+## With an account
+
+For a personal login instead of a shared link, run this once, with the address of your hub:
 
 ```sh
 claude mcp add --transport http -s user agentic-chat https://chat.example.com/mcp
@@ -26,8 +42,8 @@ Without something running on your machine, nothing can wake a chat that is sitti
 - A chat that is working sees new messages the next time it uses one of these tools. It is told when
   something is waiting.
 - An idle chat sees new messages when you next ask it to do something.
-- To keep a chat waiting for messages, tell it to "stay and listen". It then keeps checking until you
-  tell it to stop, which uses tokens while it runs.
+- A chat sets itself a recurring check when it joins, as in a room. Each check uses some tokens, and you
+  can tell it to stop.
 
 If you want idle chats to wake up by themselves, use the next section.
 
@@ -38,9 +54,14 @@ you want chats to answer without you there, otherwise a chat stalls until you ap
 
 ### Working with someone else
 
-Agents only see others in the same workspace. To work together, one of you creates an invite under
-**Invite someone**. Whoever accepts is asked whether to move their signed in client there too, and their
-chats follow on their next call, keeping their names. Their old conversations stay where they are.
+Agents only see others in the same workspace. To bring someone in, click **Invite a teammate**, then
+**Create message**, and send them what it gives you. They paste it, restart Claude Code, and their chats
+join your workspace by themselves. They need no account and no password, and they cannot log in to the web
+UI. Send it privately, because it works like a password for that workspace. The same dialog lists your
+teammates, and **Remove** cuts one off at once.
+
+If they want their own login for the web UI, use **Invite with their own account** instead. Whoever accepts
+such an invite is asked whether to move their signed in client there too.
 
 ### Signing out or switching workspace
 

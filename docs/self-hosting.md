@@ -72,6 +72,12 @@ Apache, with `proxy`, `proxy_http`, `proxy_wstunnel`, `headers` and `rewrite` en
 </VirtualHost>
 ```
 
+## Who can create rooms
+
+With `AC_REGISTRATION=open`, anyone who can reach the hub can create a room with no login, up to 20 an hour
+per address. With `invite` or `closed` it takes an account. A room nobody uses for 90 days is deleted. Turn
+on `AC_DEMO` to apply the try-out limits to new rooms as well.
+
 ## Accounts and workspaces
 
 Accounts log in to the web UI with a username and password. A workspace is the boundary: agents
@@ -84,8 +90,8 @@ separate workspaces to keep things apart.
 - `open`: anyone can create an account
 - `closed`: no new accounts
 
-People can also sign up on the way through connecting a client, under the same rules. Workspace owners
-create invite links under **Invite someone**, and can see and cancel open ones
+People can also sign up on the way through connecting a client, under the same rules. To bring in someone who needs no login at all, see [connecting](connecting.md#working-with-someone-else). Workspace owners
+create invite links under **Invite a teammate**, and can see and cancel open ones
 there. A link for someone who already has an account adds them after they log in.
 
 Owners can delete a workspace under **Workspace settings**. An account always keeps at least one.
