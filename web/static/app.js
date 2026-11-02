@@ -109,10 +109,6 @@ function renderAuth() {
   const story = h("div", { class: "auth-story" },
     h("h1", {}, "Let your coding sessions ask each other."),
     h("p", {}, "The session working on the frontend can ask the one working on the backend, and get the answer right where it is working."),
-    !oauthRequest() && h("div", { class: "auth-connect" },
-      h("h2", {}, "Add it to Claude Code, nothing to install"),
-      connectBlocks(),
-      h("p", {}, "Then run ", h("code", {}, "/mcp"), " in a chat and sign in here.")),
     demoDiagram());
 
   const formHost = h("div", { class: "auth-form" });
@@ -385,10 +381,17 @@ function drawRail() {
         lamp(a.state),
         h("span", { class: "name" }, a.name, a.description && h("span", { class: "what" }, a.description)))),
       h("button", { class: "btn rail-add", onclick: connectDialog }, "Connect Claude Code"),
+      h("button", {
+        class: "btn rail-add",
+        onclick: async () => {
+          const room = await api("POST", "/api/rooms", {});
+          location.assign(`/r/${room.token}`);
+        },
+      }, "Create a room"),
       h("h2", {}, "People"),
       people.map((a) => h("button", { class: "jack", onclick: () => peopleDialog() },
         lamp(a.state), h("span", { class: "name" }, a.name))),
-      workspace?.role === "owner" && h("button", { class: "btn rail-add", onclick: peopleDialog }, "Invite someone")),
+      workspace?.role === "owner" && h("button", { class: "btn rail-add", onclick: peopleDialog }, "Invite a teammate")),
     h("div", { class: "rail-foot" },
       h("button", { class: "link", onclick: accountDialog }, state.me.username),
       h("button", { class: "link", onclick: logout }, "Log out")));
@@ -791,6 +794,13 @@ function setupSteps(token) {
       commandBlock(`claude mcp add --transport http agentic-chat ${origin}/mcp --header "Authorization: Bearer ${token}"`)));
 }
 
+function teammateMessage(token) {
+  return `Join my agent workspace. Run these two commands, then restart Claude Code. If the first one says it found nothing, that is fine.
+
+claude mcp remove agentic-chat -s user
+claude mcp add --transport http -s user agentic-chat ${origin}/mcp --header "Authorization: Bearer ${token}"`;
+}
+
 function connectCommand() {
   return `claude mcp add --transport http -s user agentic-chat ${origin}/mcp`;
 }
@@ -908,6 +918,41 @@ async function peopleDialog() {
   const inviteHost = h("div", {});
   const openInvites = h("div", { class: "row-list" });
 
+  // The simple way in: one message to paste, nothing else for them to do.
+  const shareHost = h("div", {});
+  const teammates = h("div", { class: "row-list" });
+  const drawTeammates = async () => {
+    const list = (await api("GET", "/api/me/connections")).filter((c) => c.shared && c.workspace_id === state.workspaceId);
+    teammates.replaceChildren(...list.map((c) => h("div", {},
+      h("span", {}, `Teammate, last active ${formatTime(c.last_used_at)}`),
+      h("button", {
+        class: "btn plain",
+        onclick: async () => {
+          try {
+            await api("DELETE", `/api/me/connections/${c.id}`);
+            await drawTeammates();
+          } catch (err) { error.textContent = err.message; }
+        },
+      }, "Remove"))));
+  };
+  const teammateArea = h("div", { class: "teammate-area" },
+    h("h3", {}, "Invite a teammate"),
+    h("p", {}, "Send them one message. They paste it and they are in, with no account and no password."),
+    h("button", {
+      class: "btn",
+      onclick: async () => {
+        try {
+          const share = await api("POST", `/api/workspaces/${state.workspaceId}/share`, {});
+          shareHost.replaceChildren(
+            h("p", { class: "warn" }, "Send this privately, it works like a password for this workspace, and it is shown only once."),
+            commandBlock(teammateMessage(share.token)));
+          await drawTeammates();
+        } catch (err) { error.textContent = err.message; }
+      },
+    }, "Create message"),
+    shareHost,
+    teammates);
+
   // Typing the name makes sure this is the workspace meant, it cannot be undone.
   const deleteArea = h("details", { class: "delete-area" },
     h("summary", {}, "Delete this workspace"),
@@ -970,6 +1015,7 @@ async function peopleDialog() {
 
   const content = h("div", { class: "dlg" },
     h("h2", {}, `Workspace: ${workspace?.name}`),
+    isOwner && teammateArea,
     h("h3", {}, "People"),
     h("p", { class: "note" }, "Everyone here can read every conversation in this workspace and talk to its agents."),
     h("div", { class: "row-list" }, rows),
@@ -990,10 +1036,13 @@ async function peopleDialog() {
             await drawInvites();
           } catch (err) { error.textContent = err.message; }
         },
-      }, "Create invite link"),
+      }, "Invite with their own account"),
       h("button", { class: "btn", onclick: () => dialog.close() }, "Close")));
   const dialog = showDialog(content);
-  if (isOwner) drawInvites().catch((err) => { error.textContent = err.message; });
+  if (isOwner) {
+    drawInvites().catch((err) => { error.textContent = err.message; });
+    drawTeammates().catch((err) => { error.textContent = err.message; });
+  }
 }
 
 function accountDialog() {
@@ -1082,9 +1131,169 @@ async function logout() {
   location.reload();
 }
 
+// Rooms: no accounts, whoever has the link is in.
+
+function renderLanding() {
+  const error = h("p", { class: "error", role: "alert" });
+  const create = h("button", {
+    class: "btn create-room",
+    onclick: async () => {
+      create.disabled = true;
+      error.textContent = "";
+      try {
+        const room = await api("POST", "/api/rooms", {});
+        location.assign(`/r/${room.token}`);
+      } catch (err) {
+        error.textContent = err.message;
+        create.disabled = false;
+      }
+    },
+  }, "Create room");
+  app.replaceChildren(h("main", { class: "auth" },
+    h("div", { class: "auth-story" },
+      h("h1", {}, "Let your coding sessions ask each other."),
+      h("p", {}, "Create a room and send the link to your team. Everyone's Claude joins the same pool, and any chat can ask any other. No accounts."),
+      demoDiagram()),
+    h("div", { class: "auth-form" },
+      h("div", { class: "dlg" },
+        h("h2", {}, "Start a room"),
+        h("p", {}, "You get one link. Whoever has it is in."),
+        error,
+        create,
+        h("button", { class: "switch-mode", onclick: renderAuth }, "Log in to an account")))));
+}
+
+// Each machine gets its own id, so the same folder name on two machines stays two agents.
+function roomDevice(token) {
+  const key = `room-device-${token}`;
+  let device = localStorage.getItem(key);
+  if (!device) {
+    const bytes = crypto.getRandomValues(new Uint8Array(9));
+    device = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    localStorage.setItem(key, device);
+  }
+  return device;
+}
+
+async function renderRoom(token) {
+  const link = `${origin}/r/${token}`;
+  const command = `claude mcp remove agentic-chat -s user
+claude mcp add --transport http -s user agentic-chat ${link}/${roomDevice(token)}/mcp`;
+
+  const who = h("div", { class: "room-who" });
+  const threads = h("div", { class: "thread-list" });
+  const view = h("div", { class: "seq-scroll" });
+  const error = h("p", { class: "error", role: "alert" });
+  let selected = null;
+  let shown = "";
+
+  const gone = (message) => {
+    clearInterval(timer);
+    app.replaceChildren(h("main", { class: "auth" }, h("div", { class: "auth-story" },
+      h("h1", {}, "This room is gone."), h("p", {}, message),
+      h("p", {}, h("a", { href: "/", class: "room-home" }, "Create a new room")))));
+  };
+
+  const drawView = async () => {
+    if (!selected) {
+      if (shown !== "empty") {
+        shown = "empty";
+        view.replaceChildren(h("div", { class: "seq-empty" },
+          h("h2", {}, "Nothing here yet"),
+          h("p", {}, "Conversations between the chats in this room show up here as they happen.")));
+      }
+      return;
+    }
+    const messages = await api("GET", `/api/rooms/${token}/messages?thread=${selected}&limit=500`);
+    const stamp = `${selected}:${messages.length}:${state.agents.map((a) => a.state).join()}`;
+    if (stamp === shown) return;
+    const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+    shown = stamp;
+    view.replaceChildren(sequence(messages));
+    if (atBottom) view.scrollTop = view.scrollHeight;
+  };
+
+  const refresh = async () => {
+    let room;
+    try {
+      room = await api("GET", `/api/rooms/${token}`);
+    } catch (err) {
+      if (err.status === 404) gone("It was deleted, or nobody used it for a long time.");
+      return;
+    }
+    state.agents = room.agents;
+    who.replaceChildren(...(room.agents.length
+      ? room.agents.map((a) => h("div", { class: "jack room-agent" },
+        lamp(a.state),
+        h("span", { class: "name" }, a.name),
+        h("button", {
+          class: "link", title: `Remove ${a.name} from this room`,
+          onclick: async () => {
+            await api("DELETE", `/api/rooms/${token}/agents/${a.id}`).catch((err) => { error.textContent = err.message; });
+            await refresh();
+          },
+        }, "Remove")))
+      : [h("p", { class: "note-dim" }, "Nobody yet.")]));
+    if (!selected && room.threads.length) selected = room.threads[0].id;
+    threads.replaceChildren(...room.threads.map((t) => {
+      const row = h("button", {
+        class: "thread-row", "aria-current": t.id === selected ? "true" : "false",
+        onclick: async () => { selected = t.id; await refresh(); },
+      },
+      h("span", { class: "who" }, t.participants.join(", "), h("span", { class: "when" }, formatTime(t.last_at))),
+      h("span", { class: "preview" }, t.preview));
+      return row;
+    }));
+    await drawView();
+  };
+
+  const remove = h("button", {
+    class: "btn danger",
+    onclick: async () => {
+      try {
+        await api("DELETE", `/api/rooms/${token}`);
+        gone("You deleted it, with everything that was said in it.");
+      } catch (err) { error.textContent = err.message; }
+    },
+  }, "Yes, delete this room");
+
+  app.replaceChildren(h("div", { class: "room" },
+    h("aside", { class: "rail room-side auth-connect" },
+      h("h1", {}, "Your room"),
+      h("section", {},
+        h("h2", {}, "1. Send this link to your team"),
+        commandBlock(link)),
+      h("section", {},
+        h("h2", {}, "2. Run this, then restart Claude Code"),
+        commandBlock(command),
+        h("p", { class: "note-dim" }, "If the first line finds nothing, that is fine. Nothing to install.")),
+      h("section", {},
+        h("h2", {}, "3. Tell your chat"),
+        commandBlock("Join the room as backend"),
+        h("p", { class: "note-dim" }, "Use any name. It then checks for messages in the background, which uses some tokens each time, until you tell it to stop.")),
+      h("section", {},
+        h("h2", {}, "Who is here"),
+        who),
+      error,
+      h("details", { class: "delete-area" },
+        h("summary", {}, "Delete this room"),
+        h("p", { class: "note-dim" }, "Removes everyone and everything said here, for good."),
+        remove)),
+    h("section", { class: "threads" }, threads),
+    h("section", { class: "sheet" }, view)));
+
+  await refresh();
+  const timer = setInterval(() => { if (!document.hidden) refresh().catch(() => {}); }, 4000);
+}
+
 // Boot
 
 (async function boot() {
+  const roomPath = location.pathname.match(/^\/r\/([\w-]+)\/?$/);
+  if (roomPath) {
+    await renderRoom(roomPath[1]);
+    return;
+  }
   try {
     state.config = await api("GET", "/api/config");
   } catch (err) {
@@ -1094,7 +1303,11 @@ async function logout() {
   try {
     await start();
   } catch (err) {
-    if (err.status === 401) renderAuth();
-    else app.replaceChildren(h("p", { class: "empty" }, err.message));
+    if (err.status === 401) {
+      // Signing in a client or following an invite needs an account, everything else starts with a room.
+      const needsLogin = oauthRequest() || inviteFromURL() || state.config.registration !== "open";
+      if (needsLogin) renderAuth();
+      else renderLanding();
+    } else app.replaceChildren(h("p", { class: "empty" }, err.message));
   }
 })();
