@@ -768,3 +768,58 @@ func TestStandInIsKeptWhileAnotherChatUsesIt(t *testing.T) {
 		t.Fatalf("removed a name a chat is still using: %v", err)
 	}
 }
+
+func TestRoomsStayOutOfTheWayOfAccounts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateRoom(ctx, "room-a", "~room-a"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountUsers(ctx); n != 0 {
+		t.Fatalf("a room counted as an account: %d", n)
+	}
+	first, err := s.CreateAccount(ctx, "first", "h", "", "first")
+	if err != nil || !first.IsAdmin {
+		t.Fatalf("first real account should be the admin: %v %+v", err, first)
+	}
+}
+
+func TestIdleRoomsGoAwayWithEverythingInThem(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	idle, _ := s.CreateRoom(ctx, "idle", "~idle")
+	busy, _ := s.CreateRoom(ctx, "busy", "~busy")
+	s.EnsureRoomConnection(ctx, idle, "idle-conn")
+	conn, err := s.ConnectionByToken(ctx, "idle-conn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _, err := s.JoinAgent(ctx, conn, "s1", "one", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, _ := s.JoinAgent(ctx, conn, "s2", "two", 0)
+	s.InsertMessage(ctx, idle.WorkspaceID, 0, a.ID, b.ID, "note", "forgotten words", 0)
+	s.w.ExecContext(ctx, `UPDATE rooms SET last_active_at = ? WHERE id = ?`, time.Now().Add(-100*24*time.Hour).UnixMilli(), idle.ID)
+
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RoomByToken(ctx, "idle"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("idle room kept: %v", err)
+	}
+	if _, err := s.RoomByToken(ctx, "busy"); err != nil {
+		t.Fatalf("active room removed: %v", err)
+	}
+	if _, err := s.UserByID(ctx, idle.UserID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("hidden owner kept: %v", err)
+	}
+	if _, err := s.UserByID(ctx, busy.UserID); err != nil {
+		t.Fatalf("hidden owner of an active room removed: %v", err)
+	}
+	var left int
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'forgotten'`).Scan(&left)
+	if left != 0 {
+		t.Fatal("search index still holds messages of the deleted room")
+	}
+}

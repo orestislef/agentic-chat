@@ -24,6 +24,7 @@ const testRedirect = "http://127.0.0.1:43210/callback"
 type chatClient struct {
 	t       *testing.T
 	url     string
+	path    string // defaults to /mcp
 	token   string
 	session string
 }
@@ -110,8 +111,14 @@ func signIn(t *testing.T, ts *testServer, u *client, workspace string) string {
 func (c *chatClient) rpc(method string, params any) (*http.Response, map[string]any) {
 	c.t.Helper()
 	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-	req, _ := http.NewRequest(http.MethodPost, c.url+"/mcp", bytes.NewReader(raw))
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	path := c.path
+	if path == "" {
+		path = "/mcp"
+	}
+	req, _ := http.NewRequest(http.MethodPost, c.url+path, bytes.NewReader(raw))
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if c.session != "" {
 		req.Header.Set("Mcp-Session-Id", c.session)
 	}
@@ -801,5 +808,134 @@ func TestMovedChatCannotActInTheOldWorkspace(t *testing.T) {
 	owner.mustJSON(http.MethodGet, "/api/workspaces/"+strconv.FormatInt(second.ID, 10)+"/messages", nil, http.StatusOK, &moved)
 	if len(moved) != 1 || moved[0].Body != "after the move" || moved[0].From != "mover" {
 		t.Fatalf("new workspace: %+v", moved)
+	}
+}
+
+func createShare(t *testing.T, ts *testServer, owner *client, ws string) string {
+	t.Helper()
+	var out struct {
+		Token string `json:"token"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/share", map[string]string{}, http.StatusCreated, &out)
+	if !strings.HasPrefix(out.Token, "acc_") {
+		t.Fatalf("token %q", out.Token)
+	}
+	return out.Token
+}
+
+func TestTeammateJoinsWithOneTokenAndNoAccount(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	mine := openChat(t, ts, signIn(t, ts, owner, ws))
+	mine.tool("join", map[string]any{"name": "driver_app"})
+
+	// All the teammate ever has is this token.
+	token := createShare(t, ts, owner, ws)
+	theirs := openChat(t, ts, token)
+	if got := theirs.tool("join", map[string]any{"name": "callcenter"}); got["you"] != "callcenter" {
+		t.Fatalf("%v", got)
+	}
+
+	// They talk both ways right away, on a hub that is closed to new accounts.
+	sent := theirs.tool("ask_agent", map[string]any{"to": "driver_app", "message": "which endpoint", "wait_seconds": 0})
+	if sent["message_id"] == nil {
+		t.Fatalf("%v", sent)
+	}
+	inbox := mine.tool("check_inbox", nil)
+	if len(inbox["messages"].([]any)) != 1 {
+		t.Fatalf("%v", inbox)
+	}
+	mine.tool("reply", map[string]any{"message_id": sent["message_id"], "message": "/orders"})
+	if got := theirs.tool("wait_for_reply", map[string]any{"message_id": sent["message_id"], "wait_seconds": 1}); got["status"] != "answered" {
+		t.Fatalf("%v", got)
+	}
+
+	// Each of their chats is its own agent too.
+	second := openChat(t, ts, token)
+	if got := second.tool("join", map[string]any{"name": "billing"}); got["you"] != "billing" {
+		t.Fatalf("%v", got)
+	}
+
+	// The token gets them nothing else: not the web UI, nor anything an owner can do.
+	for _, path := range []string{"/api/me", "/api/workspaces", "/api/me/connections", "/api/workspaces/" + ws + "/invites"} {
+		req, _ := http.NewRequest(http.MethodGet, ts.url+path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s with the shared token: %d", path, resp.StatusCode)
+		}
+	}
+
+	// The owner sees it and can cut it off, without touching their own client.
+	var list []store.Connection
+	owner.mustJSON(http.MethodGet, "/api/me/connections", nil, http.StatusOK, &list)
+	var shared *store.Connection
+	for i := range list {
+		if list[i].Shared {
+			shared = &list[i]
+		}
+	}
+	if shared == nil || shared.ClientName != "Teammate" {
+		t.Fatalf("%+v", list)
+	}
+	owner.mustJSON(http.MethodDelete, "/api/me/connections/"+strconv.FormatInt(shared.ID, 10), nil, http.StatusNoContent, nil)
+	if resp, _ := theirs.rpc("tools/list", nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("still in after being cut off: %d", resp.StatusCode)
+	}
+	if got := mine.tool("list_agents", nil); got["toolError"] != nil {
+		t.Fatalf("owner's own client was affected: %v", got)
+	}
+}
+
+func TestSameFolderNameOnTwoMachinesStaysTwoAgents(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	ownerToken := signIn(t, ts, owner, ws)
+	mine := openChat(t, ts, ownerToken)
+	mine.tool("join", map[string]any{"name": "app"})
+	// The owner's chat has closed, which would normally free the name for a reopened project.
+	endSession(t, ts, ownerToken, mine.session)
+
+	token := createShare(t, ts, owner, ws)
+	theirs := openChat(t, ts, token)
+	if got := theirs.tool("join", map[string]any{"name": "app"}); got["you"] != "app-2" {
+		t.Fatalf("teammate took over the owner's agent: %v", got)
+	}
+	// And it must not drift over later, nor the other way around.
+	if got := theirs.tool("list_agents", nil); got["you"] != "app-2" {
+		t.Fatalf("%v", got)
+	}
+	reopened := openChat(t, ts, ownerToken)
+	if got := reopened.tool("join", map[string]any{"name": "app"}); got["you"] != "app" {
+		t.Fatalf("owner lost their own name: %v", got)
+	}
+	// A teammate does not get hold of an agent made by hand either.
+	owner.createAgent(ws, "manual")
+	if got := theirs.tool("join", map[string]any{"name": "manual"}); got["you"] != "manual-2" {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestOnlyOwnersCanCreateShares(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
+	member := ts.register("member", created.Code)
+	if status, _ := member.do(http.MethodPost, "/api/workspaces/"+ws+"/share", map[string]string{}); status != http.StatusForbidden {
+		t.Fatalf("member: %d", status)
+	}
+	if status, _ := ts.newClient().do(http.MethodPost, "/api/workspaces/"+ws+"/share", map[string]string{}); status != http.StatusUnauthorized {
+		t.Fatalf("logged out: %d", status)
 	}
 }

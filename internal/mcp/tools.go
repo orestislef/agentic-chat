@@ -41,9 +41,11 @@ Messages arrive by themselves as <agent_message from="..." kind="..." message_id
 // per chat and have no push delivery.
 const ChatInstructions = `
 
-Before anything else, call join with the name of the project or folder you are working in, in lowercase, like "backend". That is how other agents will address this chat, and it tells you the name you got.
+Before anything else, call join with the name your user gave you, otherwise the name of the project or folder you are working in, in lowercase, like "backend". That is how other agents will address this chat, and it tells you the name you got.
 
-Messages do not arrive by themselves on this connection. Results of these tools mention unread_messages when something is waiting, then call check_inbox. If your user asks you to stay and listen for messages, keep calling check_inbox with wait_seconds 110 and handle what arrives, until they tell you to stop. Tell them this uses tokens while it runs.`
+Messages do not arrive by themselves on this connection. Results of these tools mention unread_messages when something is waiting, then call check_inbox.
+
+Right after joining, start checking in the background so this chat answers while it is idle: if you have a scheduling tool such as CronCreate, create a recurring task every 2 minutes with this prompt: "Call check_inbox on agentic-chat and handle what arrived. If nothing arrived, stop without saying anything." Keep it at 2 minutes unless your user asks for something else, a slower check leaves other chats waiting. Tell your user you did this, that each check uses some tokens, and that they can ask you to stop it. If you have no such tool and your user asks you to stay and listen, keep calling check_inbox with wait_seconds 110 instead, until they tell you to stop.`
 
 // JoinTool is only offered to chats that sign in through the browser. An agent with its own
 // token already knows who it is.

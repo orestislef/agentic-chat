@@ -45,6 +45,7 @@ type Server struct {
 	static  *staticHandler
 
 	oauthClients *attemptLimiter
+	roomCreates  *attemptLimiter
 }
 
 // New creates a server.
@@ -60,6 +61,7 @@ func New(cfg Config, s *store.Store, log *slog.Logger) *Server {
 		static:  newStaticHandler(web.FS),
 
 		oauthClients: newAttemptLimiter(60, time.Hour),
+		roomCreates:  newAttemptLimiter(20, time.Hour),
 	}
 	if cfg.Demo {
 		s.SetDemo(true)
@@ -80,6 +82,11 @@ func (s *Server) Handler() http.Handler {
 	mcpHandler.AgentLimit = s.agentLimit
 	mux.Handle("/mcp", s.limited(mcpHandler.ServeHTTP))
 
+	roomMCP := s.limited(s.handleRoomMCP(mcpHandler.ServeHTTP))
+	mux.HandleFunc("/r/{token}/mcp", roomMCP)
+	mux.HandleFunc("/r/{token}/{device}/mcp", roomMCP)
+	mux.HandleFunc("GET /r/{token}", s.handleRoomPage)
+
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleResourceMetadata)
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
@@ -89,6 +96,11 @@ func (s *Server) Handler() http.Handler {
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/config", s.handleConfig)
+	api.HandleFunc("POST /api/rooms", s.handleCreateRoom)
+	api.HandleFunc("GET /api/rooms/{token}", s.handleRoomState)
+	api.HandleFunc("GET /api/rooms/{token}/messages", s.handleRoomMessages)
+	api.HandleFunc("DELETE /api/rooms/{token}", s.handleDeleteRoom)
+	api.HandleFunc("DELETE /api/rooms/{token}/agents/{agentID}", s.handleRoomRemoveAgent)
 	api.HandleFunc("POST /api/auth/register", s.handleRegister)
 	api.HandleFunc("POST /api/auth/login", s.handleLogin)
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
@@ -108,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("DELETE /api/workspaces/{id}", s.withOwner(s.handleDeleteWorkspace))
 	api.HandleFunc("GET /api/workspaces/{id}/members", s.withMember(s.handleListMembers))
 	api.HandleFunc("DELETE /api/workspaces/{id}/members/{userID}", s.withMember(s.handleRemoveMember))
+	api.HandleFunc("POST /api/workspaces/{id}/share", s.withOwner(s.handleShareWorkspace))
 	api.HandleFunc("GET /api/workspaces/{id}/invites", s.withOwner(s.handleListInvites))
 	api.HandleFunc("POST /api/workspaces/{id}/invites", s.withOwner(s.handleCreateInvite))
 	api.HandleFunc("DELETE /api/workspaces/{id}/invites/{inviteID}", s.withOwner(s.handleDeleteInvite))

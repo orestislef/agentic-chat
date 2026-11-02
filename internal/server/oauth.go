@@ -309,6 +309,23 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request, u
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleShareWorkspace creates what a teammate pastes into their client to join: no account,
+// no password, no browser. The token only works in this workspace and cannot log in to the web
+// UI. The person who made it can see it among their clients and cut it off.
+func (s *Server) handleShareWorkspace(w http.ResponseWriter, r *http.Request, c *memberContext) {
+	token, err := auth.NewToken(strings.TrimSuffix(mcpserver.ConnectionTokenPrefix, "_"))
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	if err := s.store.CreateSharedConnection(r.Context(), auth.HashToken(token), c.User.ID, c.WorkspaceID); err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, map[string]string{"token": token})
+}
+
 // handleMoveConnection points a signed in client at another workspace the person belongs to.
 func (s *Server) handleMoveConnection(w http.ResponseWriter, r *http.Request, u *store.User) {
 	id, ok := pathID(r, "connectionID")

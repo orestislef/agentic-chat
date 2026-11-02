@@ -142,4 +142,19 @@ ALTER TABLE agents ADD COLUMN auto INTEGER NOT NULL DEFAULT 0;
 `, `
 -- The name a chat asked for, which can differ from what it got while that name was busy.
 ALTER TABLE chat_sessions ADD COLUMN wanted_name TEXT NOT NULL DEFAULT '';
+`, `
+-- A connection handed to a teammate, who needs no account. It belongs to whoever created it.
+ALTER TABLE connections ADD COLUMN shared INTEGER NOT NULL DEFAULT 0;
+`, `
+-- A room is a workspace you enter with a link, no account needed. Underneath it has a hidden
+-- owner, because agents always belong to a user.
+ALTER TABLE users ADD COLUMN room INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE rooms (
+	id             INTEGER PRIMARY KEY,
+	token_hash     TEXT NOT NULL UNIQUE,
+	workspace_id   INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at     INTEGER NOT NULL,
+	last_active_at INTEGER NOT NULL
+);
 `}

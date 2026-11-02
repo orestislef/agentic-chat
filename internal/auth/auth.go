@@ -107,3 +107,12 @@ func ValidatePassword(password string) error {
 	}
 	return nil
 }
+
+// NewLinkToken returns a random token short enough to read in a link, still 128 bits.
+func NewLinkToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}

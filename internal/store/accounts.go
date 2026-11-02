@@ -47,7 +47,7 @@ type Invite struct {
 // CountUsers reports how many accounts exist.
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE room = 0`).Scan(&n)
 	return n, err
 }
 
@@ -63,7 +63,7 @@ func (s *Store) CreateAccount(ctx context.Context, username, passwordHash, invit
 	defer tx.Rollback()
 
 	var existing int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&existing); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE room = 0`).Scan(&existing); err != nil {
 		return nil, err
 	}
 	now := nowMillis()

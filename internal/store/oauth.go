@@ -34,6 +34,8 @@ type Connection struct {
 	CreatedAt   int64  `json:"created_at"`
 	LastUsedAt  int64  `json:"last_used_at"`
 	ExpiresAt   int64  `json:"-"`
+	// Shared means it was handed to a teammate, so its chats are somebody else's.
+	Shared bool `json:"shared,omitempty"`
 }
 
 // ErrAgentLimit means a workspace cannot take another agent.
@@ -113,14 +115,23 @@ func (s *Store) CreateConnection(ctx context.Context, tokenHash, clientName stri
 	return err
 }
 
+// CreateSharedConnection stores a connection meant to be handed to a teammate.
+func (s *Store) CreateSharedConnection(ctx context.Context, tokenHash string, userID, workspaceID int64) error {
+	now := nowMillis()
+	_, err := s.w.ExecContext(ctx, `
+		INSERT INTO connections (token_hash, client_name, user_id, workspace_id, created_at, last_used_at, expires_at, shared)
+		VALUES (?, 'Teammate', ?, ?, ?, ?, ?, 1)`, tokenHash, userID, workspaceID, now, now, now+connectionLifetime)
+	return err
+}
+
 // ConnectionByToken resolves a token and keeps the connection alive.
 func (s *Store) ConnectionByToken(ctx context.Context, tokenHash string) (*Connection, error) {
 	var c Connection
 	now := nowMillis()
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, client_name, user_id, workspace_id, created_at, last_used_at, expires_at
+		SELECT id, client_name, user_id, workspace_id, created_at, last_used_at, expires_at, shared
 		FROM connections WHERE token_hash = ? AND expires_at > ?`, tokenHash, now).
-		Scan(&c.ID, &c.ClientName, &c.UserID, &c.WorkspaceID, &c.CreatedAt, &c.LastUsedAt, &c.ExpiresAt)
+		Scan(&c.ID, &c.ClientName, &c.UserID, &c.WorkspaceID, &c.CreatedAt, &c.LastUsedAt, &c.ExpiresAt, &c.Shared)
 	if err != nil {
 		return nil, rowErr(err)
 	}
@@ -135,7 +146,7 @@ func (s *Store) ConnectionByToken(ctx context.Context, tokenHash string) (*Conne
 // ConnectionsForUser lists what a person has signed in.
 func (s *Store) ConnectionsForUser(ctx context.Context, userID int64) ([]Connection, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.client_name, c.user_id, c.workspace_id, w.name, c.created_at, c.last_used_at, c.expires_at
+		SELECT c.id, c.client_name, c.user_id, c.workspace_id, w.name, c.created_at, c.last_used_at, c.expires_at, c.shared
 		FROM connections c JOIN workspaces w ON w.id = c.workspace_id
 		WHERE c.user_id = ? AND c.expires_at > ? ORDER BY c.last_used_at DESC`, userID, nowMillis())
 	if err != nil {
@@ -145,7 +156,7 @@ func (s *Store) ConnectionsForUser(ctx context.Context, userID int64) ([]Connect
 	out := []Connection{}
 	for rows.Next() {
 		var c Connection
-		if err := rows.Scan(&c.ID, &c.ClientName, &c.UserID, &c.WorkspaceID, &c.Workspace, &c.CreatedAt, &c.LastUsedAt, &c.ExpiresAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ClientName, &c.UserID, &c.WorkspaceID, &c.Workspace, &c.CreatedAt, &c.LastUsedAt, &c.ExpiresAt, &c.Shared); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -303,6 +314,20 @@ func (s *Store) JoinAgent(ctx context.Context, conn *Connection, sessionHash, na
 				return err
 			}
 			if existing.UserID != conn.UserID || existing.Kind != "agent" {
+				continue
+			}
+			// A teammate's chats count as the inviter's user, but they are different people. A
+			// folder with the same name on both machines must not end up as one shared agent.
+			if conn.Shared && !existing.Auto {
+				continue
+			}
+			var foreign int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM chat_sessions s JOIN connections x ON x.id = s.connection_id
+				WHERE s.agent_id = ? AND x.id <> ? AND (x.shared = 1 OR ?)`, existing.ID, conn.ID, conn.Shared).Scan(&foreign); err != nil {
+				return err
+			}
+			if foreign > 0 {
 				continue
 			}
 			var busy int
