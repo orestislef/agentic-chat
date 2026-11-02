@@ -153,6 +153,19 @@ func (s *Store) ConnectionsForUser(ctx context.Context, userID int64) ([]Connect
 	return out, rows.Err()
 }
 
+// MoveConnection points a signed in client at another workspace. The caller checks that the
+// person is a member there. Chats behind it follow on their next call.
+func (s *Store) MoveConnection(ctx context.Context, userID, connectionID, workspaceID int64) error {
+	res, err := s.w.ExecContext(ctx, `UPDATE connections SET workspace_id = ? WHERE id = ? AND user_id = ?`, workspaceID, connectionID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // DeleteConnection signs a client out. Only its owner can do that.
 func (s *Store) DeleteConnection(ctx context.Context, userID, connectionID int64) error {
 	res, err := s.w.ExecContext(ctx, `DELETE FROM connections WHERE id = ? AND user_id = ?`, connectionID, userID)

@@ -309,6 +309,39 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request, u
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleMoveConnection points a signed in client at another workspace the person belongs to.
+func (s *Server) handleMoveConnection(w http.ResponseWriter, r *http.Request, u *store.User) {
+	id, ok := pathID(r, "connectionID")
+	if !ok {
+		writeError(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	var in struct {
+		WorkspaceID int64 `json:"workspace_id"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if _, err := s.store.MemberRole(r.Context(), in.WorkspaceID, u.ID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "workspace not found")
+			return
+		}
+		s.internalError(w, r, err)
+		return
+	}
+	err := s.store.MoveConnection(r.Context(), u.ID, id, in.WorkspaceID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleDeleteConnection(w http.ResponseWriter, r *http.Request, u *store.User) {
 	id, ok := pathID(r, "connectionID")
 	if !ok {

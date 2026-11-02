@@ -664,3 +664,142 @@ func endSession(t *testing.T, ts *testServer, token, session string) {
 	}
 	resp.Body.Close()
 }
+
+// The situation that started this: someone signs in first and accepts an invite afterwards.
+func TestMovingAClientAfterAcceptingAnInvite(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
+	owner := ts.register("owner", "")
+	shared := owner.workspaceID()
+	ownerChat := openChat(t, ts, signIn(t, ts, owner, shared))
+	ownerChat.tool("join", map[string]any{"name": "driver_app"})
+
+	guest := ts.register("guest", "")
+	own := guest.workspaceID()
+	guestToken := signIn(t, ts, guest, own)
+	guestChat := openChat(t, ts, guestToken)
+	guestChat.tool("join", map[string]any{"name": "webapi"})
+	guestChat.tool("send_message", map[string]any{"to": "guest", "message": "words in the old workspace"})
+
+	var created struct {
+		Code string `json:"code"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+shared+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
+	guest.mustJSON(http.MethodPost, "/api/invites/accept", map[string]string{"code": created.Code}, http.StatusOK, nil)
+
+	// Joining alone changes nothing for the client, that is the gap being closed.
+	if got := guestChat.tool("send_message", map[string]any{"to": "driver_app", "message": "hi"}); got["toolError"] == nil {
+		t.Fatalf("reached the other workspace before moving: %v", got)
+	}
+
+	var list []store.Connection
+	guest.mustJSON(http.MethodGet, "/api/me/connections", nil, http.StatusOK, &list)
+	id := strconv.FormatInt(list[0].ID, 10)
+	sharedID, _ := strconv.ParseInt(shared, 10, 64)
+	guest.mustJSON(http.MethodPatch, "/api/me/connections/"+id, map[string]int64{"workspace_id": sharedID}, http.StatusNoContent, nil)
+
+	// The same chat follows on its next call, keeps its name, and is told.
+	got := guestChat.tool("list_agents", nil)
+	if got["you"] != "webapi" || got["name_changed"] == nil {
+		t.Fatalf("after moving: %v", got)
+	}
+	names := map[string]bool{}
+	for _, entry := range got["agents"].([]any) {
+		names[entry.(map[string]any)["name"].(string)] = true
+	}
+	if !names["driver_app"] {
+		t.Fatalf("does not see the new workspace: %v", got)
+	}
+
+	// Now they can talk, in both directions.
+	sent := guestChat.tool("ask_agent", map[string]any{"to": "driver_app", "message": "which endpoint do you call", "wait_seconds": 0})
+	if sent["message_id"] == nil {
+		t.Fatalf("ask: %v", sent)
+	}
+	inbox := ownerChat.tool("check_inbox", nil)
+	messages := inbox["messages"].([]any)
+	if len(messages) != 1 || messages[0].(map[string]any)["from"] != "webapi" {
+		t.Fatalf("inbox: %v", inbox)
+	}
+	ownerChat.tool("reply", map[string]any{"message_id": sent["message_id"], "message": "/orders"})
+	if answer := guestChat.tool("wait_for_reply", map[string]any{"message_id": sent["message_id"], "wait_seconds": 1}); answer["status"] != "answered" {
+		t.Fatalf("answer: %v", answer)
+	}
+
+	// The note only shows once, and history from the old workspace does not come along.
+	if again := guestChat.tool("list_agents", nil); again["name_changed"] != nil {
+		t.Fatalf("told twice: %v", again)
+	}
+	if hits := guestChat.tool("search_history", map[string]any{"query": "old"}); len(hits["messages"].([]any)) != 0 {
+		t.Fatalf("old workspace still readable: %v", hits)
+	}
+	// A new chat behind the same client lands in the new workspace as well.
+	fresh := openChat(t, ts, guestToken)
+	if got := fresh.tool("join", map[string]any{"name": "other"}); got["you"] != "other" {
+		t.Fatalf("%v", got)
+	}
+	if got := ownerChat.tool("send_message", map[string]any{"to": "other", "message": "welcome"}); got["toolError"] != nil {
+		t.Fatalf("new chat not in the shared workspace: %v", got)
+	}
+}
+
+func TestMovingAClientIsLimitedToOwnClientsAndWorkspaces(t *testing.T) {
+	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
+	alice := ts.register("alice", "")
+	bob := ts.register("bob", "")
+	aliceWs := alice.workspaceID()
+	bobWs, _ := strconv.ParseInt(bob.workspaceID(), 10, 64)
+	aliceWsID, _ := strconv.ParseInt(aliceWs, 10, 64)
+	signIn(t, ts, alice, aliceWs)
+	var list []store.Connection
+	alice.mustJSON(http.MethodGet, "/api/me/connections", nil, http.StatusOK, &list)
+	id := strconv.FormatInt(list[0].ID, 10)
+
+	// Into a workspace you are not a member of.
+	if status, _ := alice.do(http.MethodPatch, "/api/me/connections/"+id, map[string]int64{"workspace_id": bobWs}); status != http.StatusNotFound {
+		t.Fatalf("into someone else's workspace: %d", status)
+	}
+	// Someone else's client, into a workspace they do belong to.
+	if status, _ := bob.do(http.MethodPatch, "/api/me/connections/"+id, map[string]int64{"workspace_id": bobWs}); status != http.StatusNotFound {
+		t.Fatalf("moved someone else's client: %d", status)
+	}
+	// Not logged in.
+	if status, _ := ts.newClient().do(http.MethodPatch, "/api/me/connections/"+id, map[string]int64{"workspace_id": aliceWsID}); status != http.StatusUnauthorized {
+		t.Fatalf("logged out: %d", status)
+	}
+	alice.mustJSON(http.MethodGet, "/api/me/connections", nil, http.StatusOK, &list)
+	if list[0].WorkspaceID != aliceWsID {
+		t.Fatalf("connection moved anyway: %+v", list[0])
+	}
+}
+
+func TestMovedChatCannotActInTheOldWorkspace(t *testing.T) {
+	ts := start(t)
+	owner := ts.register("owner", "")
+	first := owner.workspaceID()
+	var second store.Workspace
+	owner.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "second"}, http.StatusCreated, &second)
+	token := signIn(t, ts, owner, first)
+	chat := openChat(t, ts, token)
+	chat.tool("join", map[string]any{"name": "mover"})
+	chat.tool("send_message", map[string]any{"to": "owner", "message": "before the move"})
+
+	var list []store.Connection
+	owner.mustJSON(http.MethodGet, "/api/me/connections", nil, http.StatusOK, &list)
+	owner.mustJSON(http.MethodPatch, "/api/me/connections/"+strconv.FormatInt(list[0].ID, 10), map[string]int64{"workspace_id": second.ID}, http.StatusNoContent, nil)
+
+	// Even the first call after moving, including one that sends, happens in the new place.
+	got := chat.tool("send_message", map[string]any{"to": "owner", "message": "after the move"})
+	if got["toolError"] != nil {
+		t.Fatalf("%v", got)
+	}
+	var old []store.Message
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+first+"/messages", nil, http.StatusOK, &old)
+	if len(old) != 1 || old[0].Body != "before the move" {
+		t.Fatalf("old workspace: %+v", old)
+	}
+	var moved []store.Message
+	owner.mustJSON(http.MethodGet, "/api/workspaces/"+strconv.FormatInt(second.ID, 10)+"/messages", nil, http.StatusOK, &moved)
+	if len(moved) != 1 || moved[0].Body != "after the move" || moved[0].From != "mover" {
+		t.Fatalf("new workspace: %+v", moved)
+	}
+}

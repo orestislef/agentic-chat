@@ -98,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/oauth/client", s.withUser(s.handleOAuthClientInfo))
 	api.HandleFunc("POST /api/oauth/approve", s.withUser(s.handleOAuthApprove))
 	api.HandleFunc("GET /api/me/connections", s.withUser(s.handleListConnections))
+	api.HandleFunc("PATCH /api/me/connections/{connectionID}", s.withUser(s.handleMoveConnection))
 	api.HandleFunc("DELETE /api/me/connections/{connectionID}", s.withUser(s.handleDeleteConnection))
 
 	api.HandleFunc("GET /api/workspaces", s.withUser(s.handleListWorkspaces))

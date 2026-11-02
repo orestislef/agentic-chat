@@ -53,6 +53,7 @@ type caller struct {
 	sessionHash string
 	removed     bool
 	wanted      string
+	moved       bool
 }
 
 // NewHandler creates the /mcp endpoint.
@@ -182,6 +183,15 @@ func (h *Handler) authenticate(r *http.Request) (*caller, error) {
 		return nil, err
 	}
 	c.agent, c.removed, c.wanted = state.Agent, state.Removed, state.Wanted
+	// The client was moved to another workspace. The chat must not act in the old one for a
+	// single call more, so it drops its agent here and gets a new one in the new workspace.
+	if c.agent != nil && c.agent.WorkspaceID != conn.WorkspaceID {
+		if c.wanted == "" {
+			c.wanted = c.agent.Name
+		}
+		c.agent = nil
+		c.moved = true
+	}
 	return c, nil
 }
 
@@ -249,8 +259,15 @@ func (h *Handler) callTool(ctx context.Context, c *caller, req *mcp.Request) *mc
 	default:
 		if c.agent == nil && c.conn != nil {
 			// A chat that skipped join still works, under a name it can change later.
-			if c.agent, _, err = h.joinAs(ctx, c, "chat"); err != nil {
+			name := c.wanted
+			if name == "" {
+				name = "chat"
+			}
+			if c.agent, _, err = h.joinAs(ctx, c, name); err != nil {
 				break
+			}
+			if c.moved {
+				renamed = "This chat moved to another workspace and is now " + c.agent.Name + ". Agents you knew may not be here, use list_agents."
 			}
 		}
 		out, err = h.tools.call(ctx, c.agent, params.Name, params.Arguments)
