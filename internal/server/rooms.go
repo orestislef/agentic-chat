@@ -33,21 +33,56 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !s.roomCreates.Allow(s.clientIP(r)) {
-		writeError(w, http.StatusTooManyRequests, "too many new rooms from this address, try again later")
+	token, err := s.newRoom(r)
+	if errors.Is(err, errTooManyRooms) {
+		writeError(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
-	token, err := auth.NewLinkToken()
 	if err != nil {
 		s.internalError(w, r, err)
 		return
 	}
+	writeJSON(w, http.StatusCreated, map[string]string{"token": token})
+}
+
+// createRoomForChat is the create_room tool. It follows the same rules as the front page: on a hub
+// without open registration it takes an account, which agent tokens and shared connections are not,
+// because those can be in the hands of someone the hub's owner never let in.
+func (s *Server) createRoomForChat(r *http.Request, hasAccount bool) (string, error) {
+	if s.cfg.Registration != RegistrationOpen && !hasAccount {
+		return "", errors.New("this hub needs an account to create a room and this connection has none. Tell your user, they can create one on the hub's front page")
+	}
+	base := s.hubURL(r)
+	if base == "" {
+		return "", errors.New("could not work out this hub's address. Tell your user, they can create a room on the hub's front page")
+	}
+	token, err := s.newRoom(r)
+	if errors.Is(err, errTooManyRooms) {
+		return "", err
+	}
+	if err != nil {
+		s.log.Error("create room", "err", err)
+		return "", errors.New("could not create the room, try again")
+	}
+	return base + "/r/" + token, nil
+}
+
+var errTooManyRooms = errors.New("too many new rooms from this address, try again later")
+
+// newRoom creates a room and returns its link token. Callers decide who may do this.
+func (s *Server) newRoom(r *http.Request) (string, error) {
+	if !s.roomCreates.Allow(s.clientIP(r)) {
+		return "", errTooManyRooms
+	}
+	token, err := auth.NewLinkToken()
+	if err != nil {
+		return "", err
+	}
 	// The ~ cannot appear in a real username, so this name can never collide with or log in as one.
 	if _, err := s.store.CreateRoom(r.Context(), auth.HashToken(token), "~room-"+auth.HashToken(token)[:16]); err != nil {
-		s.internalError(w, r, err)
-		return
+		return "", err
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"token": token})
+	return token, nil
 }
 
 func (s *Server) roomFromPath(w http.ResponseWriter, r *http.Request) *store.Room {

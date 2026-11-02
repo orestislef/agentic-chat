@@ -44,6 +44,10 @@ type Handler struct {
 	ResourceMetadataURL func(*http.Request) string
 	// AgentLimit caps agents a workspace can create through join, 0 means no cap. Optional.
 	AgentLimit func(ctx context.Context, workspaceID int64) int
+	// CreateRoom makes a room and returns its link. hasAccount says the caller signed in with its
+	// own account, as opposed to an agent token or a shared connection. Errors go to the model.
+	// Optional.
+	CreateRoom func(r *http.Request, hasAccount bool) (string, error)
 }
 
 // caller is who a request comes from. A chat that has not joined yet has no agent.
@@ -145,7 +149,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx = hub.WithIdempotencyKey(ctx, key)
 	}
-	resp := h.dispatch(ctx, c, &req)
+	resp := h.dispatch(ctx, r, c, &req)
 	if ctx.Err() != nil {
 		// The hub is shutting down or the client left. Nothing was answered, so this
 		// must read as "try again" and not as a tool failure the model has to handle.
@@ -214,7 +218,7 @@ func (h *Handler) settleName(ctx context.Context, c *caller) string {
 	return "This chat is now " + settled.Name + ", that name came free."
 }
 
-func (h *Handler) dispatch(ctx context.Context, c *caller, req *mcp.Request) *mcp.Response {
+func (h *Handler) dispatch(ctx context.Context, r *http.Request, c *caller, req *mcp.Request) *mcp.Response {
 	switch req.Method {
 	case "initialize":
 		caps := map[string]any{"tools": map[string]any{}}
@@ -232,12 +236,12 @@ func (h *Handler) dispatch(ctx context.Context, c *caller, req *mcp.Request) *mc
 		}
 		return mcp.Result(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
-		return h.callTool(ctx, c, req)
+		return h.callTool(ctx, r, c, req)
 	}
 	return mcp.Error(req.ID, mcp.CodeMethodNotFound, "method not found: "+req.Method)
 }
 
-func (h *Handler) callTool(ctx context.Context, c *caller, req *mcp.Request) *mcp.Response {
+func (h *Handler) callTool(ctx context.Context, r *http.Request, c *caller, req *mcp.Request) *mcp.Response {
 	var params struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -256,6 +260,8 @@ func (h *Handler) callTool(ctx context.Context, c *caller, req *mcp.Request) *mc
 		out, err = h.join(ctx, c, params.Arguments)
 	case c.removed:
 		err = errors.New("this chat's agent was removed in the web UI. Tell your user. If they want this chat back, call join")
+	case params.Name == "create_room":
+		out, err = h.createRoom(r, c)
 	default:
 		if c.agent == nil && c.conn != nil {
 			// A chat that skipped join still works, under a name it can change later.
@@ -294,6 +300,20 @@ func (h *Handler) callTool(ctx context.Context, c *caller, req *mcp.Request) *mc
 		return mcp.Error(req.ID, mcp.CodeInternalError, "could not encode result")
 	}
 	return mcp.Result(req.ID, mcp.TextResult(string(text), false))
+}
+
+func (h *Handler) createRoom(r *http.Request, c *caller) (any, error) {
+	if h.CreateRoom == nil {
+		return nil, errors.New("this hub cannot create rooms")
+	}
+	link, err := h.CreateRoom(r, c.conn != nil && !c.conn.Shared)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"link": link,
+		"note": "Give this link to your user. Opening it shows the command that connects a machine to the room. Connecting replaces this machine's agentic-chat connection, so its chats leave the current workspace. Anyone with the link can read the room, remove chats or delete it, so share it privately.",
+	}, nil
 }
 
 func (h *Handler) join(ctx context.Context, c *caller, args json.RawMessage) (any, error) {

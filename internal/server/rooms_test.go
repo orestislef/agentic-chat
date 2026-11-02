@@ -290,6 +290,74 @@ func TestCreatingRoomsFollowsTheHubsRules(t *testing.T) {
 	}
 }
 
+func TestChatCreatesARoomThatWorks(t *testing.T) {
+	ts := openHub(t)
+	chat := joinRoom(t, ts, createRoom(t, ts), "laptop")
+	chat.tool("join", map[string]any{"name": "first"})
+
+	got := chat.tool("create_room", nil)
+	link, _ := got["link"].(string)
+	prefix := ts.url + "/r/"
+	if !strings.HasPrefix(link, prefix) {
+		t.Fatalf("%v", got)
+	}
+	// The new room works, and the chat that made it did not move there.
+	other := joinRoom(t, ts, strings.TrimPrefix(link, prefix), "laptop")
+	if got := other.tool("join", map[string]any{"name": "first"}); got["you"] != "first" {
+		t.Fatalf("%v", got)
+	}
+	if got := chat.tool("list_agents", nil); got["you"] != "first" || len(got["agents"].([]any)) != 0 {
+		t.Fatalf("%v", got)
+	}
+}
+
+func TestCreateRoomToolNeedsAnAccountOnAPrivateHub(t *testing.T) {
+	ts := start(t) // invite only
+	owner := ts.register("owner", "")
+	ws := owner.workspaceID()
+
+	signedIn := openChat(t, ts, signIn(t, ts, owner, ws))
+	if got := signedIn.tool("create_room", nil); got["link"] == nil {
+		t.Fatalf("signed in with an account: %v", got)
+	}
+
+	// A chat in a room made by that account has no account of its own.
+	var room struct {
+		Token string `json:"token"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/rooms", map[string]string{}, http.StatusCreated, &room)
+	inRoom := &chatClient{t: t, url: ts.url, path: "/r/" + room.Token + "/laptop/mcp"}
+	if resp, out := inRoom.rpc("initialize", map[string]any{"protocolVersion": "2025-06-18"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("initialize: %d %v", resp.StatusCode, out)
+	} else {
+		inRoom.session = resp.Header.Get("Mcp-Session-Id")
+	}
+	if got := inRoom.tool("create_room", nil); got["toolError"] == nil || got["link"] != nil {
+		t.Fatalf("room chat made a room on a private hub: %v", got)
+	}
+
+	var agent struct {
+		Token string `json:"token"`
+	}
+	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/agents", map[string]string{"name": "bot"}, http.StatusCreated, &agent)
+	withToken := &chatClient{t: t, url: ts.url, token: agent.Token}
+	if got := withToken.tool("create_room", nil); got["toolError"] == nil || got["link"] != nil {
+		t.Fatalf("agent token made a room on a private hub: %v", got)
+	}
+}
+
+func TestCreateRoomToolSharesTheAddressLimit(t *testing.T) {
+	ts := openHub(t)
+	chat := joinRoom(t, ts, createRoom(t, ts), "laptop")
+	var got map[string]any
+	for i := 0; i < 25; i++ {
+		got = chat.tool("create_room", nil)
+	}
+	if got["toolError"] == nil || !strings.Contains(got["toolError"].(string), "too many") {
+		t.Fatalf("no limit on the tool: %v", got)
+	}
+}
+
 func TestDemoLimitsApplyToRooms(t *testing.T) {
 	ts := openHub(t, func(c *Config) { c.Demo = true })
 	token := createRoom(t, ts)

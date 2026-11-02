@@ -80,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 		return s.hubURL(r) + "/.well-known/oauth-protected-resource"
 	}
 	mcpHandler.AgentLimit = s.agentLimit
+	mcpHandler.CreateRoom = s.createRoomForChat
 	mux.Handle("/mcp", s.limited(mcpHandler.ServeHTTP))
 
 	roomMCP := s.limited(s.handleRoomMCP(mcpHandler.ServeHTTP))

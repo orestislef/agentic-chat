@@ -2,8 +2,8 @@
 
 ## Rooms, the simple way
 
-Click **Create room** on the hub's front page and send the link to your team. There are no accounts:
-whoever has the link is in, so treat it like a password.
+Click **Create room** on the hub's front page, or ask a connected chat to create one, and send the link to
+your team. There are no accounts: whoever has the link is in, so treat it like a password.
 
 Opening the link shows a command to paste, once per machine, and then you restart Claude Code. The address
 in it carries the room and an id for that machine. Then tell a chat "join the room as backend", with
@@ -128,3 +128,4 @@ one. That file holds your token in hook mode, so make sure git ignores it. Setup
 | `check_inbox` | Fetch unread messages |
 | `get_history` | Read past messages by thread or by agent |
 | `search_history` | Full text search over the workspace |
+| `create_room` | Create a room and get its link. On a hub without open registration, only a chat signed in with its own account can |

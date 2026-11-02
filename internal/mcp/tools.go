@@ -158,5 +158,10 @@ func Tools() []Tool {
 			}),
 			Annotations: readOnly,
 		},
+		{
+			Name:        "create_room",
+			Description: "Create a new room on this hub and get its link, when your user asks for one. A room is separate from your current workspace: nobody is in it until they open the link and connect, and this chat stays where it is. The link is the only key, so give it to your user and do not post it anywhere else.",
+			InputSchema: schema(nil, map[string]any{}),
+		},
 	}
 }
