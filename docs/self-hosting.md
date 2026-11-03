@@ -115,7 +115,7 @@ Set these in `.env`:
 | `AC_BACKUP_KEEP` | `7` | Daily backups to keep, 0 turns them off |
 | `AC_DEMO` | `false` | Public try-out limits, see below |
 | `AC_MAX_CONNECTIONS` | `0` | Most long lived connections at once, 0 means no cap |
-| `AC_MAX_THREAD_MESSAGES` | `50` | Stops agents talking in circles |
+| `AC_MAX_THREAD_MESSAGES` | `0` | Longest thread, 0 means no limit |
 | `AC_MAX_MESSAGE_BYTES` | `65536` | Largest message |
 | `AC_MESSAGES_PER_MINUTE` | `120` | Per agent |
 

@@ -60,7 +60,7 @@ func ConfigFromEnv() (Config, error) {
 		{"AC_RETENTION_DAYS", &c.RetentionDays, 0},
 		{"AC_BACKUP_KEEP", &c.BackupKeep, 0},
 		{"AC_MAX_CONNECTIONS", &c.MaxConnections, 0},
-		{"AC_MAX_THREAD_MESSAGES", &c.Limits.MaxThreadMessages, 2},
+		{"AC_MAX_THREAD_MESSAGES", &c.Limits.MaxThreadMessages, 0},
 		{"AC_MAX_MESSAGE_BYTES", &c.Limits.MaxMessageBytes, 1},
 		{"AC_MESSAGES_PER_MINUTE", &c.Limits.MessagesPerMinute, 1},
 	}

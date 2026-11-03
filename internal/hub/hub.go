@@ -51,14 +51,14 @@ var (
 
 // Limits protects the hub and keeps two agents from talking in circles forever.
 type Limits struct {
-	MaxThreadMessages int
+	MaxThreadMessages int // 0 means a thread can grow without limit
 	MaxMessageBytes   int
 	MessagesPerMinute int
 }
 
 // DefaultLimits are used unless the operator overrides them.
 func DefaultLimits() Limits {
-	return Limits{MaxThreadMessages: 50, MaxMessageBytes: 64 * 1024, MessagesPerMinute: 120}
+	return Limits{MaxThreadMessages: 0, MaxMessageBytes: 64 * 1024, MessagesPerMinute: 120}
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
@@ -235,7 +235,7 @@ func (h *Hub) send(ctx context.Context, from, to *store.Agent, kind, body string
 		if n == 0 {
 			return nil, ErrUnknownThread
 		}
-		if n >= h.limits.MaxThreadMessages {
+		if h.limits.MaxThreadMessages > 0 && n >= h.limits.MaxThreadMessages {
 			return nil, fmt.Errorf("%w: thread %d has %d messages, stop here and check with your user before continuing", ErrLimitReached, threadID, h.limits.MaxThreadMessages)
 		}
 	}

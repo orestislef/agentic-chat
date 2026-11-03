@@ -218,6 +218,25 @@ func TestThreadLimitStopsLoops(t *testing.T) {
 	}
 }
 
+func TestThreadsUnlimitedByDefault(t *testing.T) {
+	e := setup(t, DefaultLimits())
+	ctx := context.Background()
+	first, err := e.hub.Send(ctx, e.frontend, "backend", "ask", "1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		from := e.backend
+		to := "frontend"
+		if i%2 == 1 {
+			from, to = e.frontend, "backend"
+		}
+		if _, err := e.hub.Send(ctx, from, to, "note", "more", first.ThreadID); err != nil {
+			t.Fatalf("message %d: %v", i+2, err)
+		}
+	}
+}
+
 func TestRateLimit(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MessagesPerMinute = 2

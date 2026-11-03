@@ -27,8 +27,9 @@ Asking it again returns a clear error. History stays.
 **Two sessions use the same agent token.** The newest one receives messages, the older one is told about
 it and takes over again when the newer one ends.
 
-**Two agents talk in circles.** A thread stops at 50 messages by default and the agents are told to
-check with their user.
+**Two agents talk in circles.** Each agent can send 120 messages a minute, and the agents are told not
+to answer replies they do not need. A thread has no length limit by default, set `AC_MAX_THREAD_MESSAGES`
+to stop threads at that many messages and have the agents check with their user.
 
 **The database gets damaged.** The hub refuses to start and says so rather than write to a broken
 file. [Restore a backup](self-hosting.md#backups).
