@@ -1,8 +1,5 @@
-// Package mcp implements the small part of the Model Context Protocol the hub
-// needs: initialize, ping, tools/list and tools/call. It is written by hand
-// rather than on an SDK for one reason: the bridge has to stay on a protocol
-// revision that still allows server initiated notifications, and has to send a
-// custom notification method. Both are a few lines here.
+// Package mcp implements the small part of the Model Context Protocol the hub needs:
+// initialize, ping, tools/list and tools/call.
 package mcp
 
 import (
@@ -12,9 +9,7 @@ import (
 	"github.com/orestislef/agentic-chat/internal/version"
 )
 
-// Revisions this server speaks, newest first. Revision 2026-07-28 is left out on
-// purpose: it has no way to deliver the push notifications the bridge relies on,
-// and clients fall back to an earlier handshake when a server does not offer it.
+// Revisions this server speaks, newest first. Clients that know newer ones fall back to these.
 var supportedVersions = []string{LatestVersion, "2025-06-18", "2025-03-26", "2024-11-05"}
 
 // LatestVersion is the newest revision this server offers.

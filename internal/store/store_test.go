@@ -3,823 +3,174 @@ package store
 import (
 	"context"
 	"errors"
-	"os"
+	"fmt"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func newTestStore(t *testing.T) *Store {
+func open(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	s, err := Open(filepath.Join(t.TempDir(), "rooms.db"))
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-func TestFirstAccountBecomesAdminOnly(t *testing.T) {
-	s := newTestStore(t)
+func TestSameNameIsTheSameMemberWithItsUnreadMessages(t *testing.T) {
+	s := open(t)
 	ctx := context.Background()
-	a, err := s.CreateAccount(ctx, "alice", "h", "", "alice")
+	room, err := s.CreateRoom(ctx, "h1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.CreateAccount(ctx, "bob", "h", "", "bob")
-	if err != nil {
+	backend, created, err := s.Join(ctx, room.ID, "session-a", "backend")
+	if err != nil || !created {
+		t.Fatalf("%v %v", created, err)
+	}
+	app, _, _ := s.Join(ctx, room.ID, "session-b", "app")
+	if _, err := s.Post(ctx, room.ID, app.Name, "backend", "which endpoint?"); err != nil {
 		t.Fatal(err)
 	}
-	if !a.IsAdmin || b.IsAdmin {
-		t.Fatalf("admin flags wrong: alice=%v bob=%v", a.IsAdmin, b.IsAdmin)
+
+	// The chat restarts: new session, same name.
+	again, created, err := s.Join(ctx, room.ID, "session-c", "backend")
+	if err != nil || created || again.ID != backend.ID {
+		t.Fatalf("restart got a different member: %v %v %v", again, created, err)
 	}
-	if _, err := s.CreateAccount(ctx, "ALICE", "h", "", "x"); !errors.Is(err, ErrConflict) {
-		t.Fatalf("case insensitive duplicate: got %v", err)
+	got, err := s.Unread(ctx, again, 10)
+	if err != nil || len(got) != 1 || got[0].Body != "which endpoint?" || got[0].To != "backend" {
+		t.Fatalf("%v %v", got, err)
+	}
+	if more, _ := s.Unread(ctx, again, 10); len(more) != 0 {
+		t.Fatalf("read twice: %v", more)
+	}
+	// The old session still speaks for the same name.
+	if m, err := s.SessionMember(ctx, "session-a"); err != nil || m.ID != backend.ID {
+		t.Fatalf("%v %v", m, err)
 	}
 }
 
-func TestInviteLimits(t *testing.T) {
-	s := newTestStore(t)
+func TestNewMemberStartsAtNowAndOwnMessagesAreNotUnread(t *testing.T) {
+	s := open(t)
 	ctx := context.Background()
-	owner, _ := s.CreateAccount(ctx, "owner", "h", "", "team")
-	ws, _ := s.WorkspacesForUser(ctx, owner.ID)
-	future := time.Now().Add(time.Hour).UnixMilli()
-	if _, err := s.CreateInvite(ctx, ws[0].ID, owner.ID, "code", 1, future); err != nil {
-		t.Fatal(err)
+	room, _ := s.CreateRoom(ctx, "h1")
+	a, _, _ := s.Join(ctx, room.ID, "a", "a")
+	s.Post(ctx, room.ID, "a", "", "before b joined")
+	b, _, _ := s.Join(ctx, room.ID, "b", "b")
+	if got, _ := s.Unread(ctx, b, 10); len(got) != 0 {
+		t.Fatalf("a newcomer got old messages as new: %v", got)
 	}
-	if _, err := s.CreateAccount(ctx, "first", "h", "code", ""); err != nil {
-		t.Fatalf("first use: %v", err)
+	s.Post(ctx, room.ID, "b", "", "hello")
+	s.Post(ctx, room.ID, "a", "b", "hi b")
+	all, forMe, err := s.CountUnread(ctx, b)
+	if err != nil || all != 1 || forMe != 1 {
+		t.Fatalf("%d %d %v", all, forMe, err)
 	}
-	if _, err := s.CreateAccount(ctx, "second", "h", "code", ""); !errors.Is(err, ErrInviteInvalid) {
-		t.Fatalf("second use: got %v", err)
+	got, _ := s.Unread(ctx, a, 10)
+	if len(got) != 1 || got[0].Body != "hello" {
+		t.Fatalf("%v", got)
 	}
-	// The failed registration must not leave an account behind.
-	if _, err := s.UserByUsername(ctx, "second"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("account leaked after failed invite: %v", err)
-	}
-	if _, err := s.CreateInvite(ctx, ws[0].ID, owner.ID, "old", 5, time.Now().Add(-time.Hour).UnixMilli()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CreateAccount(ctx, "third", "h", "old", ""); !errors.Is(err, ErrInviteInvalid) {
-		t.Fatalf("expired invite: got %v", err)
+	history, _ := s.History(ctx, room.ID, 0, 10)
+	if len(history) != 3 || history[0].Body != "before b joined" {
+		t.Fatalf("%v", history)
 	}
 }
 
-func TestLastOwnerCannotLeave(t *testing.T) {
-	s := newTestStore(t)
+func TestRoomsAreSeparate(t *testing.T) {
+	s := open(t)
 	ctx := context.Background()
-	owner, _ := s.CreateAccount(ctx, "owner", "h", "", "team")
-	ws, _ := s.WorkspacesForUser(ctx, owner.ID)
-	if err := s.RemoveMember(ctx, ws[0].ID, owner.ID); !errors.Is(err, ErrLastOwner) {
-		t.Fatalf("got %v", err)
+	one, _ := s.CreateRoom(ctx, "one")
+	two, _ := s.CreateRoom(ctx, "two")
+	s.Join(ctx, one.ID, "x", "backend")
+	b2, _, _ := s.Join(ctx, two.ID, "y", "backend")
+	s.Post(ctx, one.ID, "backend", "", "only in one")
+	if got, _ := s.Unread(ctx, b2, 10); len(got) != 0 {
+		t.Fatalf("leaked across rooms: %v", got)
+	}
+	if got, _ := s.Search(ctx, two.ID, []string{"only"}, 10); len(got) != 0 {
+		t.Fatalf("search leaked: %v", got)
+	}
+	if got, _ := s.Search(ctx, one.ID, []string{"ONLY", "one"}, 10); len(got) != 1 {
+		t.Fatalf("search: %v", got)
+	}
+	if got, _ := s.Search(ctx, one.ID, []string{"%"}, 10); len(got) != 0 {
+		t.Fatalf("wildcards are not escaped: %v", got)
 	}
 }
 
-// fixture creates a workspace with two agents.
-func fixture(t *testing.T, s *Store) (ws int64, a, b *Agent) {
-	t.Helper()
+func TestRemovingAndDeleting(t *testing.T) {
+	s := open(t)
 	ctx := context.Background()
-	u, err := s.CreateAccount(ctx, "owner", "h", "", "team")
-	if err != nil {
+	room, _ := s.CreateRoom(ctx, "h1")
+	s.Join(ctx, room.ID, "a", "backend")
+	s.Post(ctx, room.ID, "backend", "", "said before")
+	if err := s.RemoveMember(ctx, room.ID, "backend"); err != nil {
 		t.Fatal(err)
 	}
-	list, _ := s.WorkspacesForUser(ctx, u.ID)
-	ws = list[0].ID
-	a, err = s.CreateAgent(ctx, ws, u.ID, "frontend", "", "ta")
-	if err != nil {
+	if _, err := s.SessionMember(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed chat still in: %v", err)
+	}
+	if h, _ := s.History(ctx, room.ID, 0, 10); len(h) != 1 {
+		t.Fatal("history lost with the member")
+	}
+	if err := s.RemoveMember(ctx, room.ID, "backend"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
-	b, err = s.CreateAgent(ctx, ws, u.ID, "backend", "", "tb")
-	if err != nil {
+	s.Join(ctx, room.ID, "b", "app")
+	if err := s.DeleteRoom(ctx, room.ID); err != nil {
 		t.Fatal(err)
 	}
-	return ws, a, b
-}
-
-func TestThreadsAndInbox(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-
-	ask, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "ask", "how does pagination work", 0)
-	if err != nil {
+	if _, err := s.RoomByToken(ctx, "h1"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
-	if ask.ThreadID != ask.ID {
-		t.Fatalf("new thread should take message id, got thread %d message %d", ask.ThreadID, ask.ID)
+	if _, err := s.SessionMember(ctx, "b"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("session outlived its room")
 	}
-	if ask.From != "frontend" || ask.To != "backend" {
-		t.Fatalf("names not resolved: %+v", ask)
-	}
-
-	unread, _ := s.Unread(ctx, b.ID, 10)
-	if len(unread) != 1 {
-		t.Fatalf("want 1 unread, got %d", len(unread))
-	}
-	if err := s.MarkRead(ctx, b.ID, ask.ID); err != nil {
-		t.Fatal(err)
-	}
-	unread, _ = s.Unread(ctx, b.ID, 10)
-	if len(unread) != 0 {
-		t.Fatalf("want 0 unread, got %d", len(unread))
-	}
-
-	reply, err := s.InsertMessage(ctx, ws, ask.ThreadID, b.ID, a.ID, "reply", "cursor based", ask.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.ReplyTo(ctx, ask.ID)
-	if err != nil || got.ID != reply.ID {
-		t.Fatalf("reply lookup: %v %+v", err, got)
-	}
-
-	threads, err := s.Threads(ctx, ws, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(threads) != 1 || threads[0].Messages != 2 || len(threads[0].Participants) != 2 {
-		t.Fatalf("threads: %+v", threads)
+	if h, _ := s.History(ctx, room.ID, 0, 10); len(h) != 0 {
+		t.Fatal("messages outlived their room")
 	}
 }
 
-func TestMarkReadOnlyTouchesOwnMessages(t *testing.T) {
-	s := newTestStore(t)
+func TestRoomFull(t *testing.T) {
+	s := open(t)
 	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	m, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "hi", 0)
-	if err := s.MarkRead(ctx, a.ID, m.ID); err != nil {
-		t.Fatal(err)
-	}
-	unread, _ := s.Unread(ctx, b.ID, 10)
-	if len(unread) != 1 {
-		t.Fatal("sender was able to mark the recipient's message as read")
-	}
-}
-
-func TestSearchAndHistoryPaging(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	var last int64
-	for _, body := range []string{"redis cache layer", "postgres schema", "the cache was stale"} {
-		m, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", body, 0)
-		if err != nil {
+	room, _ := s.CreateRoom(ctx, "h1")
+	for i := range MaxMembers {
+		if _, _, err := s.Join(ctx, room.ID, fmt.Sprint("s", i), fmt.Sprint("m", i)); err != nil {
 			t.Fatal(err)
 		}
-		last = m.ID
 	}
-	hits, err := s.Search(ctx, ws, "cache", 10)
-	if err != nil {
+	if _, _, err := s.Join(ctx, room.ID, "extra", "extra"); !errors.Is(err, ErrRoomFull) {
 		t.Fatal(err)
 	}
-	if len(hits) != 2 {
-		t.Fatalf("want 2 hits, got %d", len(hits))
-	}
-	// FTS operators and stray quotes must be treated as plain text.
-	if _, err := s.Search(ctx, ws, `cache" OR NOT (`, 10); err != nil {
-		t.Fatalf("search must not fail on odd input: %v", err)
-	}
-
-	page, err := s.History(ctx, ws, HistoryFilter{AgentID: a.ID, WithID: b.ID, BeforeID: last, Limit: 1})
-	if err != nil {
+	// An existing name still gets in.
+	if _, _, err := s.Join(ctx, room.ID, "again", "m0"); err != nil {
 		t.Fatal(err)
 	}
-	if len(page) != 1 || page[0].Body != "postgres schema" {
-		t.Fatalf("paging: %+v", page)
-	}
 }
 
-func TestPruneKeepsSearchIndexConsistent(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "ephemeral words", 0)
-	n, err := s.PruneMessages(ctx, time.Now().Add(time.Hour).UnixMilli())
-	if err != nil || n != 1 {
-		t.Fatalf("prune: n=%d err=%v", n, err)
-	}
-	hits, err := s.Search(ctx, ws, "ephemeral", 10)
-	if err != nil || len(hits) != 0 {
-		t.Fatalf("search after prune: %v %+v", err, hits)
-	}
-}
-
-func TestWorkspaceIsolation(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	other, _ := s.CreateAccount(ctx, "other", "h", "", "elsewhere")
-	otherWs, _ := s.WorkspacesForUser(ctx, other.ID)
-	m, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "private words", 0)
-
-	if _, err := s.MessageByID(ctx, otherWs[0].ID, m.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("message visible across workspaces: %v", err)
-	}
-	hits, _ := s.Search(ctx, otherWs[0].ID, "private", 10)
-	if len(hits) != 0 {
-		t.Fatal("search crossed workspaces")
-	}
-	if _, err := s.AgentByName(ctx, otherWs[0].ID, "frontend"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("agent visible across workspaces: %v", err)
-	}
-}
-
-func TestDamagedDatabaseRefusesToOpen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "broken.db")
+func TestReopenKeepsEverythingAndCleanRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rooms.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
-	data, err := os.ReadFile(path)
-	if err != nil {
+	ctx := context.Background()
+	room, _ := s.CreateRoom(ctx, "h1")
+	s.Join(ctx, room.ID, "a", "backend")
+	s.Post(ctx, room.ID, "backend", "", "kept")
+	if err := s.Clean(ctx); err != nil {
 		t.Fatal(err)
-	}
-	for i := range data {
-		data[i] = 0xAB
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
-	if _, err := Open(path); err == nil {
-		t.Fatal("opened a damaged database without complaint")
-	}
-}
-
-func TestDatabaseWithBadPagesIsDetected(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bitrot.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ws, a, b := fixture(t, s)
-	for i := 0; i < 500; i++ {
-		if _, err := s.InsertMessage(context.Background(), ws, 0, a.ID, b.ID, "note", "some text to fill the pages", 0); err != nil {
-			t.Fatal(err)
-		}
 	}
 	s.Close()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Keep the header intact and scribble over everything after the first pages.
-	for i := 8192; i < len(data); i++ {
-		data[i] = 0xAB
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(path); err == nil {
-		t.Fatal("did not notice damaged pages")
-	}
-}
-
-func TestBackupIsUsableAndLeavesNoTempFile(t *testing.T) {
-	dir := t.TempDir()
-	s, err := Open(filepath.Join(dir, "live.db"))
+	s, err = Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "worth keeping", 0)
-
-	target := filepath.Join(dir, "copy.db")
-	if err := s.Backup(ctx, target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(target + ".tmp"); !os.IsNotExist(err) {
-		t.Fatal("temporary file left behind")
-	}
-	restored, err := Open(target)
-	if err != nil {
-		t.Fatalf("backup does not open: %v", err)
-	}
-	defer restored.Close()
-	hits, err := restored.Search(ctx, ws, "keeping", 10)
-	if err != nil || len(hits) != 1 {
-		t.Fatalf("backup content: %v %+v", err, hits)
-	}
-}
-
-func TestRetryKeyStoresOnce(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	first, created, err := s.InsertMessageKeyed(ctx, ws, 0, a.ID, b.ID, "ask", "q", 0, "k1")
-	if err != nil || !created {
-		t.Fatalf("first: %v created=%v", err, created)
-	}
-	second, created, err := s.InsertMessageKeyed(ctx, ws, 0, a.ID, b.ID, "ask", "q", 0, "k1")
-	if err != nil || created || second.ID != first.ID {
-		t.Fatalf("retry: %v created=%v id=%d", err, created, second.ID)
-	}
-	// The key belongs to the sender, another agent using the same value is unrelated.
-	_, created, err = s.InsertMessageKeyed(ctx, ws, 0, b.ID, a.ID, "ask", "q", 0, "k1")
-	if err != nil || !created {
-		t.Fatalf("other sender: %v created=%v", err, created)
-	}
-}
-
-func TestPragmasApply(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	expect := map[string]string{"journal_mode": "wal", "auto_vacuum": "2", "synchronous": "2", "foreign_keys": "1"}
-	for pragma, want := range expect {
-		var got string
-		if err := s.w.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Errorf("%s = %s, want %s", pragma, got, want)
-		}
-	}
-}
-
-func TestMaintainCleansUp(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	owner := a.UserID
-
-	// An expired invite, a used up invite and one that is still good.
-	s.CreateInvite(ctx, ws, owner, "expired", 5, time.Now().Add(-time.Hour).UnixMilli())
-	s.CreateInvite(ctx, ws, owner, "used", 1, time.Now().Add(time.Hour).UnixMilli())
-	s.CreateAccount(ctx, "guest", "h", "used", "")
-	s.CreateInvite(ctx, ws, owner, "good", 5, time.Now().Add(time.Hour).UnixMilli())
-
-	// A revoked agent without history goes, one that history names stays.
-	gone, _ := s.CreateAgent(ctx, ws, owner, "gone", "", "tg")
-	s.RevokeAgent(ctx, ws, gone.ID)
-	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "history", 0)
-	s.RevokeAgent(ctx, ws, a.ID)
-
-	s.CreateSession(ctx, "old", owner, time.Now().Add(-time.Hour).UnixMilli())
-
-	if err := s.Maintain(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	var invites, agents, sessions int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM invites`).Scan(&invites)
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE id = ?`, gone.ID).Scan(&agents)
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&sessions)
-	if invites != 1 || agents != 0 || sessions != 0 {
-		t.Fatalf("invites=%d revoked agent rows=%d sessions=%d", invites, agents, sessions)
-	}
-	hist, err := s.History(ctx, ws, HistoryFilter{Limit: 10})
-	if err != nil || len(hist) != 1 || hist[0].From != "frontend" {
-		t.Fatalf("history must keep naming a revoked agent: %v %+v", err, hist)
-	}
-}
-
-func TestPruneInBatchesAndReclaimsSpace(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	big := make([]byte, 4096)
-	for i := range big {
-		big[i] = 'x'
-	}
-	for i := 0; i < 2500; i++ {
-		if _, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", string(big), 0); err != nil {
-			t.Fatal(err)
-		}
-	}
-	pages := func() (n int) {
-		s.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&n)
-		return n
-	}
-	before := pages()
-	n, err := s.PruneMessages(ctx, time.Now().Add(time.Hour).UnixMilli())
-	if err != nil || n != 2500 {
-		t.Fatalf("pruned %d: %v", n, err)
-	}
-	for i := 0; i < 5; i++ { // one run frees a limited number of pages
-		if err := s.Maintain(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if after := pages(); after >= before/2 {
-		t.Fatalf("disk space not given back: %d pages before, %d after", before, after)
-	}
-}
-
-func TestDemoPruneOnlyTouchesDemoRows(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	// Everything from before the flag: the admin, a colleague and their workspaces.
-	admin, _ := s.CreateAccount(ctx, "admin", "h", "", "admin space")
-	before, _ := s.CreateAccount(ctx, "colleague", "h", "", "colleague space")
-	beforeWs, _ := s.WorkspacesForUser(ctx, before.ID)
-	a, _ := s.CreateAgent(ctx, beforeWs[0].ID, before.ID, "keep", "", "t1")
-	b, _ := s.CreateAgent(ctx, beforeWs[0].ID, before.ID, "keep2", "", "t2")
-	s.InsertMessage(ctx, beforeWs[0].ID, 0, a.ID, b.ID, "note", "real words", 0)
-
-	s.SetDemo(true)
-	visitor, err := s.CreateAccount(ctx, "visitor", "h", "", "visitor space")
-	if err != nil {
-		t.Fatal(err)
-	}
-	vw, _ := s.WorkspacesForUser(ctx, visitor.ID)
-	if !vw[0].Demo {
-		t.Fatal("workspace created under demo mode is not marked")
-	}
-	x, _ := s.CreateAgent(ctx, vw[0].ID, visitor.ID, "x", "", "t3")
-	y, _ := s.CreateAgent(ctx, vw[0].ID, visitor.ID, "y", "", "t4")
-	s.InsertMessage(ctx, vw[0].ID, 0, x.ID, y.ID, "note", "throwaway words", 0)
-
-	// Admins stay exempt, also for what they create while the flag is on.
-	adminExtra, err := s.CreateWorkspace(ctx, "second", admin)
-	if err != nil || adminExtra.Demo {
-		t.Fatalf("admin workspace marked as demo: %v %+v", err, adminExtra)
-	}
-
-	wiped, users, err := s.PruneDemo(ctx, time.Now().Add(time.Hour).UnixMilli())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if wiped != 1 || users != 1 {
-		t.Fatalf("wiped %d workspaces and %d users", wiped, users)
-	}
-	if _, err := s.UserByUsername(ctx, "visitor"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("visitor still there: %v", err)
-	}
-	for _, name := range []string{"admin", "colleague"} {
-		if _, err := s.UserByUsername(ctx, name); err != nil {
-			t.Fatalf("%s was deleted: %v", name, err)
-		}
-	}
-	if hits, _ := s.Search(ctx, beforeWs[0].ID, "real", 10); len(hits) != 1 {
-		t.Fatalf("existing history was touched: %+v", hits)
-	}
-	// The search index must not keep what was deleted.
-	var left int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'throwaway'`).Scan(&left)
-	if left != 0 {
-		t.Fatal("search index still holds deleted demo messages")
-	}
-	if err := s.Maintain(ctx); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestThreadsNewestFirstAcrossPages(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	first, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "ask", "the oldest thread", 0)
-	// Enough newer messages in one thread to push the first thread past a whole page.
-	second, _ := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "ask", "the busy thread", 0)
-	for i := 0; i < 600; i++ {
-		if _, err := s.InsertMessage(ctx, ws, second.ThreadID, b.ID, a.ID, "note", "more", 0); err != nil {
-			t.Fatal(err)
-		}
-	}
-	threads, err := s.Threads(ctx, ws, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(threads) != 2 || threads[0].ID != second.ThreadID || threads[1].ID != first.ThreadID {
-		t.Fatalf("threads: %+v", threads)
-	}
-	if threads[0].Messages != 601 || threads[0].Preview != "the busy thread" || len(threads[0].Participants) != 2 {
-		t.Fatalf("summary: %+v", threads[0])
-	}
-	// Moving an old thread back to the top.
-	s.InsertMessage(ctx, ws, first.ThreadID, b.ID, a.ID, "reply", "back again", first.ID)
-	threads, _ = s.Threads(ctx, ws, 1)
-	if len(threads) != 1 || threads[0].ID != first.ThreadID {
-		t.Fatalf("limit and order: %+v", threads)
-	}
-	empty, _ := s.Threads(ctx, ws+999, 10)
-	if len(empty) != 0 {
-		t.Fatalf("other workspace: %+v", empty)
-	}
-}
-
-func TestSearchFindsBestAmongRecentAndStaysInWorkspace(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "cache", 0)
-	s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "a long message that mentions cache once among a lot of other unrelated words here", 0)
-	hits, err := s.Search(ctx, ws, "cache", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(hits) != 2 || hits[0].Body != "cache" {
-		t.Fatalf("best match should come first: %+v", hits)
-	}
-}
-
-func TestConcurrentWritesAllLandAndFailuresStayAlone(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	const n = 400
-	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
-		go func() {
-			// Every tenth one breaks a foreign key, which must not take its batch down with it.
-			to := b.ID
-			if i%10 == 0 {
-				to = 999999
-			}
-			_, err := s.InsertMessage(ctx, ws, 0, a.ID, to, "note", "x", 0)
-			if i%10 == 0 && err == nil {
-				err = errors.New("broken insert was accepted")
-			} else if i%10 == 0 {
-				err = nil
-			}
-			errs <- err
-		}()
-	}
-	for i := 0; i < n; i++ {
-		if err := <-errs; err != nil {
-			t.Fatal(err)
-		}
-	}
-	var stored int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&stored)
-	if stored != n-n/10 {
-		t.Fatalf("stored %d of %d", stored, n-n/10)
-	}
-}
-
-func TestCancelledWriterDoesNotBreakOthers(t *testing.T) {
-	s := newTestStore(t)
-	ws, a, b := fixture(t, s)
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	s.InsertMessage(cancelled, ws, 0, a.ID, b.ID, "note", "maybe", 0)
-	if _, err := s.InsertMessage(context.Background(), ws, 0, a.ID, b.ID, "note", "for sure", 0); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestWriteAfterCloseFailsCleanly(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "closed.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	ws, a, b := fixture(t, s)
-	s.Close()
-	done := make(chan error, 1)
-	go func() {
-		_, err := s.InsertMessage(ctx, ws, 0, a.ID, b.ID, "note", "late", 0)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("write after close reported success")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("write after close hangs")
-	}
-}
-
-func joinFixture(t *testing.T, s *Store) (*Connection, *User, int64) {
-	t.Helper()
-	ctx := context.Background()
-	u, err := s.CreateAccount(ctx, "owner", "h", "", "team")
-	if err != nil {
-		t.Fatal(err)
-	}
-	list, _ := s.WorkspacesForUser(ctx, u.ID)
-	if err := s.CreateConnection(ctx, "conn-token", "client", u.ID, list[0].ID); err != nil {
-		t.Fatal(err)
-	}
-	c, err := s.ConnectionByToken(ctx, "conn-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c, u, list[0].ID
-}
-
-func TestJoinNamesAndReclaims(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, _, ws := joinFixture(t, s)
-
-	first, created, err := s.JoinAgent(ctx, conn, "chat-1", "backend", 0)
-	if err != nil || !created || first.Name != "backend" || !first.Auto {
-		t.Fatalf("first: %v %v %+v", err, created, first)
-	}
-	// Another chat in the same project while the first is active gets its own agent.
-	second, created, err := s.JoinAgent(ctx, conn, "chat-2", "backend", 0)
-	if err != nil || !created || second.Name != "backend-2" {
-		t.Fatalf("second: %v %v %+v", err, created, second)
-	}
-	// The same chat joining again changes nothing.
-	again, created, err := s.JoinAgent(ctx, conn, "chat-1", "backend", 0)
-	if err != nil || created || again.ID != first.ID {
-		t.Fatalf("again: %v %v %+v", err, created, again)
-	}
-	// Once the first chat is gone, a new chat in that project takes over its identity.
-	if err := s.EndSession(ctx, "chat-1"); err != nil {
-		t.Fatal(err)
-	}
-	third, created, err := s.JoinAgent(ctx, conn, "chat-3", "backend", 0)
-	if err != nil || created || third.ID != first.ID {
-		t.Fatalf("reopen: %v %v %+v", err, created, third)
-	}
-	state, err := s.SessionAgent(ctx, "chat-3")
-	if err != nil || state.Removed || state.Agent.ID != first.ID || state.Wanted != "backend" {
-		t.Fatalf("session agent: %v %+v", err, state)
-	}
-
-	// Removing the agent in the web UI is visible to the chat, not silently replaced.
-	s.RevokeAgent(ctx, ws, first.ID)
-	state, err = s.SessionAgent(ctx, "chat-3")
-	if err != nil || !state.Removed || state.Agent != nil {
-		t.Fatalf("after removal: %v %+v", err, state)
-	}
-	state, _ = s.SessionAgent(ctx, "never-seen")
-	if state.Agent != nil || state.Removed {
-		t.Fatalf("unknown session: %+v", state)
-	}
-}
-
-func TestJoinNeverTakesAnotherUsersName(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, _, ws := joinFixture(t, s)
-	other, _ := s.CreateAccount(ctx, "other", "h", "", "theirs")
-	if _, err := s.CreateAgent(ctx, ws, other.ID, "backend", "", "t"); err != nil {
-		t.Fatal(err)
-	}
-	a, _, err := s.JoinAgent(ctx, conn, "chat", "backend", 0)
-	if err != nil || a.Name != "backend-2" {
-		t.Fatalf("%v %+v", err, a)
-	}
-	// A person's name is not available for an agent either.
-	b, _, err := s.JoinAgent(ctx, conn, "chat-b", "owner", 0)
-	if err != nil || b.Name != "owner-2" {
-		t.Fatalf("%v %+v", err, b)
-	}
-}
-
-func TestJoinRespectsLimitButReclaimStillWorks(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, _, _ := joinFixture(t, s)
-	if _, _, err := s.JoinAgent(ctx, conn, "a", "one", 1); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.JoinAgent(ctx, conn, "b", "two", 1); !errors.Is(err, ErrAgentLimit) {
-		t.Fatalf("got %v", err)
-	}
-	s.EndSession(ctx, "a")
-	if _, created, err := s.JoinAgent(ctx, conn, "c", "one", 1); err != nil || created {
-		t.Fatalf("reclaim over the limit: %v %v", err, created)
-	}
-}
-
-func TestOAuthCodeWorksOnce(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	_, u, ws := joinFixture(t, s)
-	s.CreateOAuthClient(ctx, OAuthClient{ID: "cl", Name: "x", RedirectURIs: []string{"http://localhost/cb"}})
-	code := OAuthCode{ClientID: "cl", UserID: u.ID, WorkspaceID: ws, RedirectURI: "http://localhost/cb", Challenge: "c"}
-	s.CreateOAuthCode(ctx, "good", code, time.Now().Add(time.Minute).UnixMilli())
-	s.CreateOAuthCode(ctx, "late", code, time.Now().Add(-time.Minute).UnixMilli())
-	if _, err := s.ConsumeOAuthCode(ctx, "good"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.ConsumeOAuthCode(ctx, "good"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("second use: %v", err)
-	}
-	if _, err := s.ConsumeOAuthCode(ctx, "late"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expired: %v", err)
-	}
-}
-
-func TestMaintainRetiresIdleChatAgentsOnly(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, u, ws := joinFixture(t, s)
-	idle, _, _ := s.JoinAgent(ctx, conn, "idle", "idle", 0)
-	fresh, _, _ := s.JoinAgent(ctx, conn, "fresh", "fresh", 0)
-	manual, _ := s.CreateAgent(ctx, ws, u.ID, "manual", "", "tm")
-	old := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
-	s.w.ExecContext(ctx, `UPDATE agents SET created_at = ?, last_seen_at = ? WHERE id IN (?, ?)`, old, old, idle.ID, manual.ID)
-	if err := s.Maintain(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.AgentByID(ctx, ws, idle.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("idle chat agent kept: %v", err)
-	}
-	if _, err := s.AgentByID(ctx, ws, fresh.ID); err != nil {
-		t.Fatalf("active chat agent retired: %v", err)
-	}
-	if _, err := s.AgentByID(ctx, ws, manual.ID); err != nil {
-		t.Fatalf("manually created agent retired: %v", err)
-	}
-}
-
-func TestStandInNameHandsOverWaitingMessages(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, _, ws := joinFixture(t, s)
-	real, _, _ := s.JoinAgent(ctx, conn, "old-chat", "backend", 0)
-	standIn, _, _ := s.JoinAgent(ctx, conn, "new-chat", "backend", 0)
-	if standIn.Name != "backend-2" {
-		t.Fatalf("%+v", standIn)
-	}
-	other, _, _ := s.JoinAgent(ctx, conn, "other", "frontend", 0)
-	s.InsertMessage(ctx, ws, 0, other.ID, standIn.ID, "ask", "sent to the stand-in", 0)
-
-	s.EndSession(ctx, "old-chat")
-	// The new chat now gets the real name, and the stand-in goes away.
-	got, _, err := s.JoinAgent(ctx, conn, "new-chat", "backend", 0)
-	if err != nil || got.ID != real.ID {
-		t.Fatalf("%v %+v", err, got)
-	}
-	if err := s.RetireChatAgent(ctx, standIn, got); err != nil {
-		t.Fatal(err)
-	}
-	unread, _ := s.Unread(ctx, real.ID, 10)
-	if len(unread) != 1 || unread[0].Body != "sent to the stand-in" {
-		t.Fatalf("message did not move: %+v", unread)
-	}
-	if _, err := s.AgentByID(ctx, ws, standIn.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("stand-in still listed: %v", err)
-	}
-}
-
-func TestStandInIsKeptWhileAnotherChatUsesIt(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	conn, _, ws := joinFixture(t, s)
-	real, _, _ := s.JoinAgent(ctx, conn, "a", "backend", 0)
-	standIn, _, _ := s.JoinAgent(ctx, conn, "b", "backend", 0)
-	if err := s.RetireChatAgent(ctx, standIn, real); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.AgentByID(ctx, ws, standIn.ID); err != nil {
-		t.Fatalf("removed a name a chat is still using: %v", err)
-	}
-}
-
-func TestRoomsStayOutOfTheWayOfAccounts(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	if _, err := s.CreateRoom(ctx, "room-a", "~room-a"); err != nil {
-		t.Fatal(err)
-	}
-	if n, _ := s.CountUsers(ctx); n != 0 {
-		t.Fatalf("a room counted as an account: %d", n)
-	}
-	first, err := s.CreateAccount(ctx, "first", "h", "", "first")
-	if err != nil || !first.IsAdmin {
-		t.Fatalf("first real account should be the admin: %v %+v", err, first)
-	}
-}
-
-func TestIdleRoomsGoAwayWithEverythingInThem(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	idle, _ := s.CreateRoom(ctx, "idle", "~idle")
-	busy, _ := s.CreateRoom(ctx, "busy", "~busy")
-	s.EnsureRoomConnection(ctx, idle, "idle-conn")
-	conn, err := s.ConnectionByToken(ctx, "idle-conn")
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, _, err := s.JoinAgent(ctx, conn, "s1", "one", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _, _ := s.JoinAgent(ctx, conn, "s2", "two", 0)
-	s.InsertMessage(ctx, idle.WorkspaceID, 0, a.ID, b.ID, "note", "forgotten words", 0)
-	s.w.ExecContext(ctx, `UPDATE rooms SET last_active_at = ? WHERE id = ?`, time.Now().Add(-100*24*time.Hour).UnixMilli(), idle.ID)
-
-	if err := s.Maintain(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.RoomByToken(ctx, "idle"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("idle room kept: %v", err)
-	}
-	if _, err := s.RoomByToken(ctx, "busy"); err != nil {
-		t.Fatalf("active room removed: %v", err)
-	}
-	if _, err := s.UserByID(ctx, idle.UserID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("hidden owner kept: %v", err)
-	}
-	if _, err := s.UserByID(ctx, busy.UserID); err != nil {
-		t.Fatalf("hidden owner of an active room removed: %v", err)
-	}
-	var left int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'forgotten'`).Scan(&left)
-	if left != 0 {
-		t.Fatal("search index still holds messages of the deleted room")
+	if m, err := s.SessionMember(ctx, "a"); err != nil || m.Name != "backend" {
+		t.Fatalf("%v %v", m, err)
 	}
 }

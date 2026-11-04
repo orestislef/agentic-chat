@@ -2,936 +2,444 @@ package server
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
-
-	"github.com/orestislef/agentic-chat/internal/hub"
 	"github.com/orestislef/agentic-chat/internal/store"
 )
 
-const password = "a long enough password"
-
-type testServer struct {
+type hub struct {
 	t   *testing.T
 	url string
+	srv *Server
 }
 
-func start(t *testing.T, mutate ...func(*Config)) *testServer {
+func start(t *testing.T) *hub {
 	t.Helper()
-	dir := t.TempDir()
-	cfg := Config{DataDir: dir, DownloadsDir: dir, Registration: RegistrationInvite, Limits: hub.DefaultLimits()}
-	for _, m := range mutate {
-		m(&cfg)
-	}
-	s, err := store.Open(filepath.Join(dir, "server.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "rooms.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
-	srv := httptest.NewServer(New(cfg, s, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
-	t.Cleanup(srv.Close)
-	return &testServer{t: t, url: srv.URL}
+	s := New(Config{}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(func() { ts.Close(); st.Close() })
+	return &hub{t: t, url: ts.URL, srv: s}
 }
 
-// client is a browser-like session with its own cookie jar.
-type client struct {
-	ts   *testServer
-	http *http.Client
+// chat is one Claude Code session talking to the hub.
+type chat struct {
+	t       *testing.T
+	url     string
+	session string
+	next    int
 }
 
-func (ts *testServer) newClient() *client {
-	jar, _ := cookiejar.New(nil)
-	return &client{ts: ts, http: &http.Client{Jar: jar}}
-}
-
-func (c *client) do(method, path string, body any) (int, []byte) {
-	c.ts.t.Helper()
-	var reader io.Reader
-	if body != nil {
-		raw, _ := json.Marshal(body)
-		reader = bytes.NewReader(raw)
+func (h *hub) chat() *chat {
+	h.t.Helper()
+	c := &chat{t: h.t, url: h.url}
+	resp, out := c.rpc("initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	if resp.StatusCode != http.StatusOK {
+		h.t.Fatalf("initialize: %d", resp.StatusCode)
 	}
-	req, _ := http.NewRequest(method, c.ts.url+path, reader)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	c.session = resp.Header.Get("Mcp-Session-Id")
+	if c.session == "" {
+		h.t.Fatal("no session")
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.ts.t.Fatal(err)
+	if !strings.Contains(out["result"].(map[string]any)["instructions"].(string), "CronCreate") {
+		h.t.Fatal("instructions miss the background check")
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, data
-}
-
-func (c *client) mustJSON(method, path string, body any, wantStatus int, into any) {
-	c.ts.t.Helper()
-	status, data := c.do(method, path, body)
-	if status != wantStatus {
-		c.ts.t.Fatalf("%s %s: status %d, want %d: %s", method, path, status, wantStatus, data)
-	}
-	if into != nil {
-		if err := json.Unmarshal(data, into); err != nil {
-			c.ts.t.Fatalf("%s %s: %v: %s", method, path, err, data)
-		}
-	}
-}
-
-func (ts *testServer) register(username, invite string) *client {
-	c := ts.newClient()
-	c.mustJSON(http.MethodPost, "/api/auth/register", map[string]string{
-		"username": username, "password": password, "invite": invite,
-	}, http.StatusCreated, nil)
 	return c
 }
 
-func (c *client) workspaceID() string {
-	var list []store.Workspace
-	c.mustJSON(http.MethodGet, "/api/workspaces", nil, http.StatusOK, &list)
-	if len(list) == 0 {
-		c.ts.t.Fatal("no workspaces")
-	}
-	return strconv.FormatInt(list[0].ID, 10)
-}
-
-func (c *client) createAgent(ws, name string) (int64, string) {
-	var out struct {
-		Agent agentView `json:"agent"`
-		Token string    `json:"token"`
-	}
-	c.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/agents", map[string]string{"name": name}, http.StatusCreated, &out)
-	return out.Agent.ID, out.Token
-}
-
-func TestRegistrationModes(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-
-	// Invite mode: the second person without a code is turned away.
-	status, _ := ts.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "stranger", "password": password})
-	if status != http.StatusForbidden {
-		t.Fatalf("no invite: status %d", status)
-	}
-
-	var created struct {
-		Code string `json:"code"`
-	}
-	ws := owner.workspaceID()
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
-	if !strings.HasPrefix(created.Code, "aci_") {
-		t.Fatalf("code %q", created.Code)
-	}
-	guest := ts.register("guest", created.Code)
-	if guest.workspaceID() != ws {
-		t.Fatal("invited user landed in the wrong workspace")
-	}
-
-	// Closed mode: nobody gets in after the first account.
-	closed := start(t, func(c *Config) { c.Registration = RegistrationClosed })
-	closed.register("first", "")
-	status, _ = closed.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "second", "password": password})
-	if status != http.StatusForbidden {
-		t.Fatalf("closed: status %d", status)
-	}
-
-	// Open mode: anyone gets a personal workspace.
-	open := start(t, func(c *Config) { c.Registration = RegistrationOpen })
-	open.register("first", "")
-	a := open.register("second", "")
-	if a.workspaceID() == "" {
-		t.Fatal("open registration gave no workspace")
-	}
-}
-
-func TestRegisterValidation(t *testing.T) {
-	ts := start(t)
-	c := ts.newClient()
-	cases := []map[string]string{
-		{"username": "x", "password": password},
-		{"username": "Has Space", "password": password},
-		{"username": "<script>", "password": password},
-		{"username": "shortpass", "password": "short"},
-	}
-	for _, body := range cases {
-		if status, _ := c.do(http.MethodPost, "/api/auth/register", body); status != http.StatusBadRequest {
-			t.Errorf("%v: status %d", body, status)
-		}
-	}
-	ts.register("taken", "")
-}
-
-func TestLoginLogoutAndBruteForceLimit(t *testing.T) {
-	ts := start(t)
-	ts.register("alice", "")
-	c := ts.newClient()
-
-	if status, _ := c.do(http.MethodGet, "/api/me", nil); status != http.StatusUnauthorized {
-		t.Fatalf("anonymous /api/me: %d", status)
-	}
-	c.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "alice", "password": password}, http.StatusOK, nil)
-	var me store.User
-	c.mustJSON(http.MethodGet, "/api/me", nil, http.StatusOK, &me)
-	if me.Username != "alice" || !me.IsAdmin {
-		t.Fatalf("me: %+v", me)
-	}
-	if status, data := c.do(http.MethodGet, "/api/me", nil); status != 200 || strings.Contains(string(data), "argon2") {
-		t.Fatal("password hash leaked")
-	}
-	c.mustJSON(http.MethodPost, "/api/auth/logout", map[string]string{}, http.StatusNoContent, nil)
-	if status, _ := c.do(http.MethodGet, "/api/me", nil); status != http.StatusUnauthorized {
-		t.Fatal("still logged in after logout")
-	}
-
-	var last int
-	for i := 0; i < 12; i++ {
-		last, _ = c.do(http.MethodPost, "/api/auth/login", map[string]string{"username": "alice", "password": "wrong password here"})
-	}
-	if last != http.StatusTooManyRequests {
-		t.Fatalf("no lockout, last status %d", last)
-	}
-}
-
-func TestChangePasswordEndsOtherSessions(t *testing.T) {
-	ts := start(t)
-	first := ts.register("alice", "")
-	second := ts.newClient()
-	second.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "alice", "password": password}, http.StatusOK, nil)
-
-	first.mustJSON(http.MethodPost, "/api/me/password", map[string]string{"current": password, "new": "a different long password"}, http.StatusNoContent, nil)
-	if status, _ := first.do(http.MethodGet, "/api/me", nil); status != http.StatusOK {
-		t.Fatal("current session should survive")
-	}
-	if status, _ := second.do(http.MethodGet, "/api/me", nil); status != http.StatusUnauthorized {
-		t.Fatal("other session should end")
-	}
-}
-
-func TestWorkspaceIsolation(t *testing.T) {
-	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
-	alice := ts.register("alice", "")
-	bob := ts.register("bob", "")
-	ws := alice.workspaceID()
-	agentID, _ := alice.createAgent(ws, "frontend")
-
-	paths := []struct{ method, path string }{
-		{http.MethodGet, "/api/workspaces/" + ws + "/agents"},
-		{http.MethodGet, "/api/workspaces/" + ws + "/messages"},
-		{http.MethodGet, "/api/workspaces/" + ws + "/threads"},
-		{http.MethodGet, "/api/workspaces/" + ws + "/members"},
-		{http.MethodDelete, "/api/workspaces/" + ws + "/agents/" + strconv.FormatInt(agentID, 10)},
-	}
-	for _, p := range paths {
-		if status, _ := bob.do(p.method, p.path, nil); status != http.StatusNotFound {
-			t.Errorf("bob %s %s: status %d", p.method, p.path, status)
-		}
-	}
-}
-
-func TestMemberCannotManageOthers(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	var created struct {
-		Code string `json:"code"`
-	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
-	member := ts.register("member", created.Code)
-	agentID, _ := owner.createAgent(ws, "ownerbot")
-	path := "/api/workspaces/" + ws + "/agents/" + strconv.FormatInt(agentID, 10)
-
-	if status, _ := member.do(http.MethodDelete, path, nil); status != http.StatusForbidden {
-		t.Fatalf("revoke: %d", status)
-	}
-	if status, _ := member.do(http.MethodGet, "/api/workspaces/"+ws+"/invites", nil); status != http.StatusForbidden {
-		t.Fatalf("invites: %d", status)
-	}
-	if status, _ := owner.do(http.MethodDelete, path, nil); status != http.StatusNoContent {
-		t.Fatalf("owner revoke: %d", status)
-	}
-}
-
-func TestRequiresJSONContentType(t *testing.T) {
-	ts := start(t)
-	resp, err := http.Post(ts.url+"/api/auth/login", "application/x-www-form-urlencoded", strings.NewReader("username=a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnsupportedMediaType {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
-}
-
-func TestCrossOriginPostIsRejected(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	req, _ := http.NewRequest(http.MethodPost, ts.url+"/api/workspaces", strings.NewReader(`{"name":"x"}`))
+func (c *chat) rpc(method string, params any) (*http.Response, map[string]any) {
+	c.t.Helper()
+	c.next++
+	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": c.next, "method": method, "params": params})
+	req, _ := http.NewRequest(http.MethodPost, c.url+"/mcp", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://evil.example")
-	resp, err := owner.http.Do(req)
+	if c.session != "" {
+		req.Header.Set("Mcp-Session-Id", c.session)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		c.t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status %d", resp.StatusCode)
+	defer resp.Body.Close()
+	var out map[string]any
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp, out
+}
+
+// call runs a tool and returns its result, and whether the tool said it failed.
+func (c *chat) call(tool string, args map[string]any) (map[string]any, string) {
+	c.t.Helper()
+	_, out := c.rpc("tools/call", map[string]any{"name": tool, "arguments": args})
+	result, ok := out["result"].(map[string]any)
+	if !ok {
+		c.t.Fatalf("%s: %v", tool, out)
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if result["isError"] == true {
+		return nil, text
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(text), &data); err != nil {
+		c.t.Fatalf("%s: %s", tool, text)
+	}
+	return data, ""
+}
+
+func (c *chat) must(tool string, args map[string]any) map[string]any {
+	c.t.Helper()
+	out, failed := c.call(tool, args)
+	if failed != "" {
+		c.t.Fatalf("%s failed: %s", tool, failed)
+	}
+	return out
+}
+
+func messages(out map[string]any) []map[string]any {
+	list := []map[string]any{}
+	for _, m := range out["messages"].([]any) {
+		list = append(list, m.(map[string]any))
+	}
+	return list
+}
+
+func TestCreateRoomSendTheLinkAndTalk(t *testing.T) {
+	h := start(t)
+	mine := h.chat()
+	created := mine.must("create_room", map[string]any{"name": "Driver App"})
+	link := created["room"].(string)
+	if created["you"] != "driver-app" || !strings.HasPrefix(link, h.url+"/r/") {
+		t.Fatalf("%v", created)
+	}
+	if invite := created["invite"].(string); !strings.Contains(invite, link) || !strings.Contains(invite, h.url+"/mcp") {
+		t.Fatalf("invite misses the link or the install command: %s", invite)
+	}
+
+	theirs := h.chat()
+	joined := theirs.must("join_room", map[string]any{"link": "  " + link + "/ ", "name": "callcenter"})
+	if joined["you"] != "callcenter" || len(joined["members"].([]any)) != 2 {
+		t.Fatalf("%v", joined)
+	}
+
+	theirs.must("send_message", map[string]any{"to": "driver-app", "message": "which endpoint sends the call?"})
+	theirs.must("send_message", map[string]any{"message": "server restart in 5 minutes"})
+	listed := mine.must("list_members", nil)
+	if listed["unread"] != float64(2) || listed["unread_for_you"] != float64(1) {
+		t.Fatalf("no hint about waiting messages: %v", listed)
+	}
+	got := messages(mine.must("read_messages", nil))
+	if len(got) != 2 || got[0]["from"] != "callcenter" || got[0]["to"] != "driver-app" || got[1]["to"] != nil {
+		t.Fatalf("%v", got)
+	}
+	if again := messages(mine.must("read_messages", nil)); len(again) != 0 {
+		t.Fatalf("read twice: %v", again)
+	}
+	// Own messages never come back as unread.
+	mine.must("send_message", map[string]any{"to": "callcenter", "message": "POST /calls"})
+	if own := messages(mine.must("read_messages", nil)); len(own) != 0 {
+		t.Fatalf("%v", own)
+	}
+	if got := messages(theirs.must("read_messages", nil)); len(got) != 1 || got[0]["text"] != "POST /calls" {
+		t.Fatalf("%v", got)
+	}
+	history := messages(theirs.must("get_history", nil))
+	if len(history) != 3 {
+		t.Fatalf("%v", history)
+	}
+	if found := messages(theirs.must("get_history", map[string]any{"search": "restart"})); len(found) != 1 {
+		t.Fatalf("%v", found)
 	}
 }
 
-func TestDownloadRejectsTraversal(t *testing.T) {
-	ts := start(t)
-	for _, file := range []string{"..%2f..%2fetc%2fpasswd", "server.db", "agentic-chat-linux-amd64.sh"} {
-		resp, err := http.Get(ts.url + "/downloads/" + file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("%s: status %d", file, resp.StatusCode)
-		}
+func TestRestartKeepsTheIdentityAndWhatWasWaiting(t *testing.T) {
+	h := start(t)
+	app := h.chat()
+	link := app.must("create_room", map[string]any{"name": "app"})["room"].(string)
+	backend := h.chat()
+	backend.must("join_room", map[string]any{"link": link, "name": "backend"})
+	app.must("send_message", map[string]any{"to": "backend", "message": "are you there?"})
+
+	// Claude Code restarts: a new session that knows nothing yet.
+	restarted := h.chat()
+	if _, failed := restarted.call("read_messages", nil); !strings.Contains(failed, "join it again with the same link and name") {
+		t.Fatalf("a chat outside a room should be told how to get back: %q", failed)
+	}
+	joined := restarted.must("join_room", map[string]any{"link": link, "name": "backend"})
+	if !strings.Contains(joined["note"].(string), "under this name before") || joined["unread"] != float64(1) {
+		t.Fatalf("%v", joined)
+	}
+	got := messages(restarted.must("read_messages", nil))
+	if len(got) != 1 || got[0]["text"] != "are you there?" {
+		t.Fatalf("lost what was waiting: %v", got)
+	}
+	members := app.must("list_members", nil)["members"].([]any)
+	if len(members) != 2 {
+		t.Fatalf("restart created a second member: %v", members)
 	}
 }
 
-func TestInstallScriptUsesRequestHost(t *testing.T) {
-	ts := start(t)
-	resp, err := http.Get(ts.url + "/install.sh")
+func TestWaitingForAnAnswer(t *testing.T) {
+	h := start(t)
+	asker := h.chat()
+	link := asker.must("create_room", map[string]any{"name": "app"})["room"].(string)
+	answerer := h.chat()
+	answerer.must("join_room", map[string]any{"link": link, "name": "backend"})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var got []map[string]any
+	began := time.Now()
+	go func() {
+		defer wg.Done()
+		got = messages(asker.must("read_messages", map[string]any{"wait_seconds": 10}))
+	}()
+	time.Sleep(200 * time.Millisecond)
+	answerer.must("send_message", map[string]any{"to": "app", "message": "here"})
+	wg.Wait()
+	if len(got) != 1 || time.Since(began) > 5*time.Second {
+		t.Fatalf("waiting read did not wake up: %v after %v", got, time.Since(began))
+	}
+	out := asker.must("read_messages", map[string]any{"wait_seconds": 1})
+	if len(messages(out)) != 0 || out["note"] != "nothing new yet" {
+		t.Fatalf("%v", out)
+	}
+}
+
+func TestMistakesGetClearAnswers(t *testing.T) {
+	h := start(t)
+	c := h.chat()
+	for _, tool := range []string{"send_message", "list_members", "get_history"} {
+		if _, failed := c.call(tool, map[string]any{"message": "x"}); !strings.Contains(failed, "not in a room") {
+			t.Fatalf("%s: %q", tool, failed)
+		}
+	}
+	if _, failed := c.call("join_room", map[string]any{"link": "hello", "name": "x"}); !strings.Contains(failed, "does not look like a room link") {
+		t.Fatal(failed)
+	}
+	if _, failed := c.call("join_room", map[string]any{"link": h.url + "/r/AAAAAAAAAAAAAAAAAAAAAA", "name": "x"}); !strings.Contains(failed, "no such room") {
+		t.Fatal(failed)
+	}
+	if _, failed := c.call("create_room", map[string]any{"name": "!!"}); !strings.Contains(failed, "give a name") {
+		t.Fatal(failed)
+	}
+	c.must("create_room", map[string]any{"name": "app"})
+	if _, failed := c.call("send_message", map[string]any{"to": "nobody", "message": "x"}); !strings.Contains(failed, `nobody named "nobody"`) {
+		t.Fatal(failed)
+	}
+	if _, failed := c.call("send_message", map[string]any{"message": "   "}); !strings.Contains(failed, "empty") {
+		t.Fatal(failed)
+	}
+	if _, failed := c.call("send_message", map[string]any{"message": strings.Repeat("x", maxMessageBytes+1)}); !strings.Contains(failed, "limit") {
+		t.Fatal(failed)
+	}
+	if _, failed := c.call("send_message", map[string]any{"to": "app", "message": "x"}); failed != "that is you" {
+		t.Fatal(failed)
+	}
+	_, out := c.rpc("tools/call", map[string]any{"name": "nope"})
+	if out["error"] == nil {
+		t.Fatalf("unknown tool: %v", out)
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	h := start(t)
+	c := h.chat()
+	c.must("create_room", map[string]any{"name": "app"})
+	for range messagesPerMinute {
+		c.must("send_message", map[string]any{"message": "x"})
+	}
+	if _, failed := c.call("send_message", map[string]any{"message": "x"}); !strings.Contains(failed, "wait a bit") {
+		t.Fatal(failed)
+	}
+}
+
+func getJSON(t *testing.T, url string, into any) int {
+	t.Helper()
+	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), ts.url+"/downloads/") {
-		t.Fatalf("script does not point back at this hub:\n%s", body)
+	if into != nil {
+		json.NewDecoder(resp.Body).Decode(into)
 	}
-	if strings.Contains(string(body), "%!") {
-		t.Fatalf("format error in script:\n%s", body)
-	}
+	return resp.StatusCode
 }
 
-func dialAgent(t *testing.T, ts *testServer, token string) *websocket.Conn {
+func do(t *testing.T, method, url string) int {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.CloseNow() })
-	return conn
-}
-
-func TestPushOverWebsocketAndRevoke(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	agentID, token := owner.createAgent(ws, "backend")
-
-	conn := dialAgent(t, ts, token)
-	var agents []agentView
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/agents", nil, http.StatusOK, &agents)
-		if stateOf(agents, "backend") == hub.StateOnline {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if stateOf(agents, "backend") != hub.StateOnline {
-		t.Fatalf("agents: %+v", agents)
-	}
-
-	// A person sends from the web UI, the agent gets the push.
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "backend", "body": "ping from a person"}, http.StatusCreated, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var frame AgentFrame
-	if err := wsjson.Read(ctx, conn, &frame); err != nil {
-		t.Fatal(err)
-	}
-	if frame.Type != "message" || frame.Message.Body != "ping from a person" || frame.Message.From != "owner" {
-		t.Fatalf("frame: %+v", frame)
-	}
-
-	// Revoking ends the connection with a code the client recognises and kills the token.
-	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/agents/"+strconv.FormatInt(agentID, 10), nil, http.StatusNoContent, nil)
-	// A copy of the message can still be in the pipe, delivery is at least once.
-	var err error
-	for err == nil {
-		_, _, err = conn.Read(ctx)
-	}
-	if websocket.CloseStatus(err) != closeRevoked {
-		t.Fatalf("expected the revoked close code, got %v", err)
-	}
-	req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/inbox", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req, _ := http.NewRequest(method, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("revoked token still works: %d", resp.StatusCode)
-	}
+	return resp.StatusCode
 }
 
-func stateOf(agents []agentView, name string) string {
-	for _, a := range agents {
-		if a.Name == name {
-			return a.State
-		}
-	}
-	return ""
-}
-
-func TestWebsocketRejectsOtherOrigin(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/workspaces/"+ws+"/ws", &websocket.DialOptions{
-		HTTPClient: owner.http,
-		HTTPHeader: http.Header{"Origin": {"https://evil.example"}},
-	})
-	if err == nil {
-		t.Fatal("cross origin websocket accepted")
-	}
-	if resp != nil && resp.StatusCode == http.StatusSwitchingProtocols {
-		t.Fatal("cross origin websocket upgraded")
-	}
-}
-
-func TestSecurityHeadersPresent(t *testing.T) {
-	ts := start(t)
-	resp, err := http.Get(ts.url + "/")
+func TestRoomPageShowsWhoIsHereAndRemovesAndDeletes(t *testing.T) {
+	h := start(t)
+	resp, err := http.Post(h.url+"/api/rooms", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var created map[string]string
+	json.NewDecoder(resp.Body).Decode(&created)
 	resp.Body.Close()
-	for _, h := range []string{"Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options"} {
-		if resp.Header.Get(h) == "" {
-			t.Errorf("missing %s", h)
-		}
+	token := created["token"]
+	if resp.StatusCode != http.StatusCreated || len(token) != 22 || created["link"] != h.url+"/r/"+token {
+		t.Fatalf("%d %v", resp.StatusCode, created)
 	}
-}
-
-func dialWorkspace(t *testing.T, c *client, ws string) *websocket.Conn {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(c.ts.url, "http")+"/api/workspaces/"+ws+"/ws", &websocket.DialOptions{
-		HTTPClient: c.http,
-		HTTPHeader: http.Header{"Origin": {c.ts.url}},
-	})
+	page, err := http.Get(h.url + "/r/" + token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.CloseNow() })
-	return conn
-}
-
-func TestRemovedMemberLosesLiveStreamAtOnce(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	var created struct {
-		Code string `json:"code"`
+	page.Body.Close()
+	if page.StatusCode != http.StatusOK || page.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("room page: %d %v", page.StatusCode, page.Header)
 	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
-	guest := ts.register("guest", created.Code)
-	conn := dialWorkspace(t, guest, ws)
 
-	// Presence events flow while the guest is a member.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var members []store.Member
-	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/members", nil, http.StatusOK, &members)
-	var guestID int64
-	for _, m := range members {
-		if m.Username == "guest" {
-			guestID = m.UserID
-		}
-	}
-	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/members/"+strconv.FormatInt(guestID, 10), nil, http.StatusNoContent, nil)
+	a, b := h.chat(), h.chat()
+	a.must("join_room", map[string]any{"link": created["link"], "name": "app"})
+	b.must("join_room", map[string]any{"link": token, "name": "backend"})
+	a.must("send_message", map[string]any{"to": "backend", "message": "first"})
+	a.must("send_message", map[string]any{"message": "second"})
 
-	for {
-		_, _, err := conn.Read(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				t.Fatal("the stream stayed open after the member was removed")
-			}
-			break
-		}
+	var room struct {
+		Members []struct {
+			Name  string `json:"name"`
+			State string `json:"state"`
+		} `json:"members"`
+		Messages []store.Message `json:"messages"`
+		Invite   string          `json:"invite"`
 	}
-	if status, _ := guest.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusNotFound {
-		t.Fatalf("removed member can still read messages: %d", status)
+	if getJSON(t, h.url+"/api/rooms/"+token, &room) != http.StatusOK {
+		t.Fatal("room state")
 	}
-}
+	if len(room.Members) != 2 || room.Members[0].State != "online" || len(room.Messages) != 2 || !strings.Contains(room.Invite, token) {
+		t.Fatalf("%+v", room)
+	}
+	first := room.Messages[0].ID
+	room.Messages = nil
+	getJSON(t, h.url+"/api/rooms/"+token+"?after="+strconv.FormatInt(first, 10), &room)
+	if len(room.Messages) != 1 || room.Messages[0].Body != "second" {
+		t.Fatalf("after: %+v", room.Messages)
+	}
 
-func TestPeerCannotReadOrConfirmAnothersMessages(t *testing.T) {
-	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
-	alice := ts.register("alice", "")
-	bob := ts.register("bob", "")
-	aliceWs := alice.workspaceID()
-	_, aliceToken := alice.createAgent(aliceWs, "secretbot")
-	_, bobToken := bob.createAgent(bob.workspaceID(), "bobbot")
-
-	var sent store.Message
-	alice.mustJSON(http.MethodPost, "/api/workspaces/"+aliceWs+"/messages", map[string]string{"to": "secretbot", "body": "private plans"}, http.StatusCreated, &sent)
-
-	// Bob's agent tries to confirm Alice's message as delivered.
-	body, _ := json.Marshal(map[string]any{"ids": []int64{sent.ID}})
-	req, _ := http.NewRequest(http.MethodPost, ts.url+"/api/agent/inbox/ack", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+bobToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	if do(t, http.MethodDelete, h.url+"/api/rooms/"+token+"/members/backend") != http.StatusNoContent {
+		t.Fatal("remove")
 	}
-	resp.Body.Close()
-
-	// The real recipient still has it unread, and only the recipient sees it.
-	inbox := func(token string) string {
-		req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/inbox?pending=1", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		data, _ := io.ReadAll(resp.Body)
-		return string(data)
+	if _, failed := b.call("read_messages", nil); !strings.Contains(failed, "not in a room") {
+		t.Fatalf("removed chat can still read: %q", failed)
 	}
-	if !strings.Contains(inbox(aliceToken), "private plans") {
-		t.Fatal("another agent was able to mark the message delivered")
+	if do(t, http.MethodDelete, h.url+"/api/rooms/"+token) != http.StatusNoContent {
+		t.Fatal("delete")
 	}
-	if strings.Contains(inbox(bobToken), "private plans") {
-		t.Fatal("message leaked to another workspace")
+	if getJSON(t, h.url+"/api/rooms/"+token, nil) != http.StatusNotFound {
+		t.Fatal("deleted room still answers")
+	}
+	if _, failed := a.call("send_message", map[string]any{"message": "x"}); !strings.Contains(failed, "not in a room") {
+		t.Fatal(failed)
 	}
 }
 
-func TestStandbyDialLeavesCurrentHolderAlone(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	_, token := owner.createAgent(ws, "backend")
-	holder := dialAgent(t, ts, token)
-	_ = holder
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	deadline := time.Now().Add(2 * time.Second)
-	var resp *http.Response
-	var err error
-	for time.Now().Before(deadline) {
-		var conn *websocket.Conn
-		conn, resp, err = websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws?standby=1", &websocket.DialOptions{
-			HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
-		})
-		if err != nil {
-			break
-		}
-		conn.CloseNow() // the holder had not registered yet, try again
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err == nil || resp == nil || resp.StatusCode != http.StatusConflict {
-		t.Fatalf("standby dial should be refused, got %v %+v", err, resp)
-	}
-}
-
-func TestCancelledInviteStopsWorking(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	var created struct {
-		Code   string `json:"code"`
-		Invite struct {
-			ID int64 `json:"id"`
-		} `json:"invite"`
-	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 5}, http.StatusCreated, &created)
-	var list []store.Invite
-	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/invites", nil, http.StatusOK, &list)
-	if len(list) != 1 {
-		t.Fatalf("invites: %+v", list)
-	}
-	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/invites/"+strconv.FormatInt(created.Invite.ID, 10), nil, http.StatusNoContent, nil)
-	status, _ := ts.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "late", "password": password, "invite": created.Code})
-	if status != http.StatusBadRequest {
-		t.Fatalf("cancelled invite: status %d", status)
-	}
-}
-
-func TestExistingUserJoinsThroughInvite(t *testing.T) {
-	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
-	owner := ts.register("owner", "")
-	other := ts.register("other", "")
-	ws := owner.workspaceID()
-	var created struct {
-		Code string `json:"code"`
-	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 2}, http.StatusCreated, &created)
-	other.mustJSON(http.MethodPost, "/api/invites/accept", map[string]string{"code": created.Code}, http.StatusOK, nil)
-	if status, _ := other.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusOK {
-		t.Fatalf("joined member cannot read: %d", status)
-	}
-	// Joining twice is refused and does not use up a second place.
-	if status, _ := other.do(http.MethodPost, "/api/invites/accept", map[string]string{"code": created.Code}); status != http.StatusConflict {
-		t.Fatalf("second join: %d", status)
-	}
-}
-
-func TestRemovingAMemberRevokesTheirAgents(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	var created struct {
-		Code string `json:"code"`
-	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 1}, http.StatusCreated, &created)
-	guest := ts.register("guest", created.Code)
-	_, token := guest.createAgent(ws, "guestbot")
-
-	var members []store.Member
-	owner.mustJSON(http.MethodGet, "/api/workspaces/"+ws+"/members", nil, http.StatusOK, &members)
-	for _, m := range members {
-		if m.Username == "guest" {
-			owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws+"/members/"+strconv.FormatInt(m.UserID, 10), nil, http.StatusNoContent, nil)
-		}
-	}
-	req, _ := http.NewRequest(http.MethodGet, ts.url+"/api/agent/me", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("agent of a removed member still works: %d", resp.StatusCode)
-	}
-}
-
-func TestDemoModeLimitsNewcomersOnly(t *testing.T) {
-	dir := t.TempDir()
-	s, err := store.Open(filepath.Join(dir, "demo.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	serve := func(demo bool) *testServer {
-		cfg := Config{DataDir: dir, DownloadsDir: dir, Registration: RegistrationOpen, Limits: hub.DefaultLimits(), Demo: demo}
-		s.SetDemo(false)
-		srv := httptest.NewServer(New(cfg, s, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
-		t.Cleanup(srv.Close)
-		return &testServer{t: t, url: srv.URL}
-	}
-
-	// The hub is in use before the flag goes on.
-	before := serve(false)
-	admin := before.register("admin", "")
-	colleague := before.register("colleague", "")
-	colleagueWs := colleague.workspaceID()
-
-	ts := serve(true)
-	var config map[string]any
-	ts.newClient().mustJSON(http.MethodGet, "/api/config", nil, http.StatusOK, &config)
-	if config["demo"] != true {
-		t.Fatalf("config: %v", config)
-	}
-
-	visitor := ts.register("visitor", "")
-	ws := visitor.workspaceID()
-	var list []store.Workspace
-	visitor.mustJSON(http.MethodGet, "/api/workspaces", nil, http.StatusOK, &list)
-	if !list[0].Demo {
-		t.Fatal("new workspace not marked as demo")
-	}
-
-	// A second workspace and a fourth agent are refused, with a reason.
-	if status, body := visitor.do(http.MethodPost, "/api/workspaces", map[string]string{"name": "more"}); status != http.StatusForbidden || !strings.Contains(string(body), "one workspace") {
-		t.Fatalf("second workspace: %d %s", status, body)
-	}
-	for _, name := range []string{"a1", "a2", "a3"} {
-		visitor.createAgent(ws, name)
-	}
-	if status, body := visitor.do(http.MethodPost, "/api/workspaces/"+ws+"/agents", map[string]string{"name": "a4"}); status != http.StatusForbidden || !strings.Contains(string(body), "at most") {
-		t.Fatalf("fourth agent: %d %s", status, body)
-	}
-
-	// Messages are capped in size, and the reason says how to get rid of the limit.
-	big := strings.Repeat("x", demoMaxMessageBytes+1)
-	if status, body := visitor.do(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "a1", "body": big}); status != http.StatusBadRequest || !strings.Contains(string(body), "host your own hub") {
-		t.Fatalf("big message: %d %s", status, body)
-	}
-	visitor.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "a1", "body": "small"}, http.StatusCreated, nil)
-
-	// Whoever was here before the flag has no limits, and neither do admins.
-	colleague2 := ts.newClient()
-	colleague2.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "colleague", "password": password}, http.StatusOK, nil)
-	for _, name := range []string{"b1", "b2", "b3", "b4"} {
-		colleague2.createAgent(colleagueWs, name)
-	}
-	colleague2.mustJSON(http.MethodPost, "/api/workspaces/"+colleagueWs+"/messages", map[string]string{"to": "b1", "body": big}, http.StatusCreated, nil)
-	admin2 := ts.newClient()
-	admin2.mustJSON(http.MethodPost, "/api/auth/login", map[string]string{"username": "admin", "password": password}, http.StatusOK, nil)
-	admin2.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "extra"}, http.StatusCreated, nil)
-	_ = admin
-}
-
-func TestDemoCapsSignupsPerAddress(t *testing.T) {
-	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen; c.Demo = true })
-	ts.register("first", "")
-	for i := 0; i < demoSignupsPerIP; i++ {
-		ts.register("user"+strconv.Itoa(i), "")
-	}
-	status, _ := ts.newClient().do(http.MethodPost, "/api/auth/register", map[string]string{"username": "onemore", "password": password})
-	if status != http.StatusTooManyRequests {
-		t.Fatalf("status %d", status)
-	}
-}
-
-func TestDemoOffChangesNothing(t *testing.T) {
-	ts := start(t, func(c *Config) { c.Registration = RegistrationOpen })
-	ts.register("first", "")
-	u := ts.register("second", "")
-	ws := u.workspaceID()
-	var list []store.Workspace
-	u.mustJSON(http.MethodGet, "/api/workspaces", nil, http.StatusOK, &list)
-	if list[0].Demo {
-		t.Fatal("marked as demo with the flag off")
-	}
-	for i := 0; i < demoMaxAgents+2; i++ {
-		u.createAgent(ws, "agent"+strconv.Itoa(i))
-	}
-	u.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "another"}, http.StatusCreated, nil)
-}
-
-func TestConnectionCapRefusesThenRecovers(t *testing.T) {
-	ts := start(t, func(c *Config) { c.MaxConnections = 2 })
-	owner := ts.register("owner", "")
-	ws := owner.workspaceID()
-	_, a := owner.createAgent(ws, "a")
-	_, b := owner.createAgent(ws, "b")
-	_, c := owner.createAgent(ws, "c")
-
-	first := dialAgent(t, ts, a)
-	dialAgent(t, ts, b)
-	time.Sleep(50 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + c}},
-	})
-	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("third connection: %v %+v", err, resp)
-	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Fatal("refusal does not say when to retry")
-	}
-	// The web UI and health checks are not long lived and stay reachable.
-	if status, _ := owner.do(http.MethodGet, "/api/workspaces/"+ws+"/agents", nil); status != http.StatusOK {
-		t.Fatalf("normal api call refused: %d", status)
-	}
-	first.CloseNow()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.url, "http")+"/api/agent/ws", &websocket.DialOptions{
-			HTTPHeader: http.Header{"Authorization": {"Bearer " + c}},
-		})
-		if err == nil {
-			conn.CloseNow()
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("slot never came free")
-}
-
-func TestConnLimiterPerAddressAndOff(t *testing.T) {
-	l := newConnLimiter(100)
-	for i := 0; i < l.perIP; i++ {
-		if !l.acquire("1.1.1.1") {
-			t.Fatal("refused below the per address limit")
-		}
-	}
-	if l.acquire("1.1.1.1") {
-		t.Fatal("one address went over its share")
-	}
-	if !l.acquire("2.2.2.2") {
-		t.Fatal("another address was refused")
-	}
-	l.release("1.1.1.1")
-	if !l.acquire("1.1.1.1") {
-		t.Fatal("released slot not usable")
-	}
-	off := newConnLimiter(0)
-	for i := 0; i < 1000; i++ {
-		if !off.acquire("1.1.1.1") {
-			t.Fatal("zero should mean no limit")
+func TestUnknownRoomsAndMalformedTokens(t *testing.T) {
+	h := start(t)
+	for _, path := range []string{"/api/rooms/AAAAAAAAAAAAAAAAAAAAAA", "/api/rooms/x", "/api/rooms/../../etc"} {
+		if code := getJSON(t, h.url+path, nil); code != http.StatusNotFound {
+			t.Fatalf("%s: %d", path, code)
 		}
 	}
 }
 
-func TestStaticFilesCompressedAndRevalidated(t *testing.T) {
-	ts := start(t)
-	// Go's client only hides compression when it asked for it itself.
-	req, _ := http.NewRequest(http.MethodGet, ts.url+"/app.js", nil)
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := http.DefaultTransport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.Header.Get("Content-Encoding") != "gzip" {
-		t.Fatalf("not compressed: %v", resp.Header)
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plain, _ := io.ReadAll(gz)
-	if !bytes.Contains(plain, []byte("renderAuth")) || len(body) >= len(plain) {
-		t.Fatalf("%d bytes on the wire, %d plain", len(body), len(plain))
-	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/javascript") {
-		t.Fatalf("content type %q, a browser refuses modules without the right one", resp.Header.Get("Content-Type"))
-	}
-	etag := resp.Header.Get("ETag")
-	if etag == "" {
-		t.Fatal("no etag")
-	}
-
-	again, _ := http.NewRequest(http.MethodGet, ts.url+"/app.js", nil)
-	again.Header.Set("If-None-Match", etag)
-	resp, err = http.DefaultClient.Do(again)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotModified {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
-
-	for path, want := range map[string]int{"/": 200, "/index.html": 200, "/style.css": 200, "/nope.js": 404, "/../internal/server/server.go": 404} {
-		req, _ := http.NewRequest(http.MethodGet, ts.url+path, nil)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+func TestRoomCreationIsLimitedPerAddress(t *testing.T) {
+	h := start(t)
+	for range roomsPerHour {
+		resp, _ := http.Post(h.url+"/api/rooms", "", nil)
 		resp.Body.Close()
-		if resp.StatusCode != want {
-			t.Errorf("%s: status %d, want %d", path, resp.StatusCode, want)
-		}
 	}
-	resp, _ = http.Post(ts.url+"/", "text/plain", strings.NewReader("x"))
+	resp, _ := http.Post(h.url+"/api/rooms", "", nil)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("post: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatal(resp.StatusCode)
 	}
-	font, _ := http.Get(ts.url + "/fonts/schibsted-grotesk-latin-wght-normal.woff2")
-	font.Body.Close()
-	if font.StatusCode != 200 || !strings.Contains(font.Header.Get("Cache-Control"), "immutable") {
-		t.Fatalf("font: %d %v", font.StatusCode, font.Header)
+	c := h.chat()
+	if _, failed := c.call("create_room", map[string]any{"name": "x"}); !strings.Contains(failed, "too many new rooms") {
+		t.Fatal(failed)
 	}
 }
 
-func TestDeleteWorkspaceRemovesEverythingInItOnly(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	keep := owner.workspaceID()
-	var extra store.Workspace
-	owner.mustJSON(http.MethodPost, "/api/workspaces", map[string]string{"name": "throwaway"}, http.StatusCreated, &extra)
-	ws := strconv.FormatInt(extra.ID, 10)
-
-	var created struct {
-		Code string `json:"code"`
+func TestTransportBasics(t *testing.T) {
+	h := start(t)
+	if code := getJSON(t, h.url+"/mcp", nil); code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /mcp: %d", code)
 	}
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/invites", map[string]int{"max_uses": 2}, http.StatusCreated, &created)
-	member := ts.register("member", created.Code)
-
-	_, token := owner.createAgent(ws, "doomed")
-	_, keepToken := owner.createAgent(keep, "stays")
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+ws+"/messages", map[string]string{"to": "doomed", "body": "vanishing words"}, http.StatusCreated, nil)
-	owner.mustJSON(http.MethodPost, "/api/workspaces/"+keep+"/messages", map[string]string{"to": "stays", "body": "lasting words"}, http.StatusCreated, nil)
-	chat := signIn(t, ts, owner, ws)
-	conn := dialAgent(t, ts, token)
-	time.Sleep(50 * time.Millisecond)
-
-	// A member cannot delete it, and neither can someone with no workspace left afterwards.
-	if status, _ := member.do(http.MethodDelete, "/api/workspaces/"+ws, nil); status != http.StatusForbidden {
-		t.Fatalf("member: %d", status)
+	c := h.chat()
+	_, out := c.rpc("tools/list", nil)
+	if n := len(out["result"].(map[string]any)["tools"].([]any)); n != 6 {
+		t.Fatalf("%d tools", n)
 	}
-	owner.mustJSON(http.MethodDelete, "/api/workspaces/"+ws, nil, http.StatusNoContent, nil)
-
-	// The open connection ends with the code that tells the client to stop.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var readErr error
-	for readErr == nil {
-		_, _, readErr = conn.Read(ctx)
+	req, _ := http.NewRequest(http.MethodPost, h.url+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatal(resp.StatusCode)
 	}
-	if websocket.CloseStatus(readErr) != closeRevoked {
-		t.Fatalf("open connection: %v", readErr)
+	req, _ = http.NewRequest(http.MethodDelete, h.url+"/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", c.session)
+	resp, _ = http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatal(resp.StatusCode)
 	}
+	if code := getJSON(t, h.url+"/healthz", nil); code != http.StatusOK {
+		t.Fatal(code)
+	}
+}
 
-	bearer := func(tok, method, path string) int {
-		req, _ := http.NewRequest(method, ts.url+path, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
-		req.Header.Set("Authorization", "Bearer "+tok)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
+func TestShutdownEndsWaitingCalls(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "rooms.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(Config{Addr: "127.0.0.1:0"}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ts := httptest.NewUnstartedServer(s.Handler())
+	ts.Config.BaseContext = func(net.Listener) context.Context { return ctx }
+	ts.Start()
+	defer ts.Close()
+	c := &chat{t: t, url: ts.URL}
+	resp, _ := c.rpc("initialize", map[string]any{})
+	c.session = resp.Header.Get("Mcp-Session-Id")
+	c.must("create_room", map[string]any{"name": "app"})
+	done := make(chan int)
+	go func() {
+		resp, _ := c.rpc("tools/call", map[string]any{"name": "read_messages", "arguments": map[string]any{"wait_seconds": 60}})
+		done <- resp.StatusCode
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case code := <-done:
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("a call cut short by shutdown should say try again, got %d", code)
 		}
-		resp.Body.Close()
-		return resp.StatusCode
-	}
-	if status := bearer(token, http.MethodGet, "/api/agent/me"); status != http.StatusUnauthorized {
-		t.Fatalf("agent token after delete: %d", status)
-	}
-	if status := bearer(chat, http.MethodPost, "/mcp"); status != http.StatusUnauthorized {
-		t.Fatalf("signed in client after delete: %d", status)
-	}
-	if status, _ := owner.do(http.MethodGet, "/api/workspaces/"+ws+"/messages", nil); status != http.StatusNotFound {
-		t.Fatalf("messages after delete: %d", status)
-	}
-
-	// The other workspace is untouched, and its search does not find the deleted words.
-	if status := bearer(keepToken, http.MethodGet, "/api/agent/me"); status != http.StatusOK {
-		t.Fatalf("other workspace's agent: %d", status)
-	}
-	var hits []store.Message
-	owner.mustJSON(http.MethodGet, "/api/workspaces/"+keep+"/messages?q=words", nil, http.StatusOK, &hits)
-	if len(hits) != 1 || hits[0].Body != "lasting words" {
-		t.Fatalf("search: %+v", hits)
-	}
-	// The member's account survives, only that workspace is gone for them.
-	if status, _ := member.do(http.MethodGet, "/api/me", nil); status != http.StatusOK {
-		t.Fatalf("member account: %d", status)
-	}
-}
-
-func TestLastWorkspaceCannotBeDeleted(t *testing.T) {
-	ts := start(t)
-	owner := ts.register("owner", "")
-	status, body := owner.do(http.MethodDelete, "/api/workspaces/"+owner.workspaceID(), nil)
-	if status != http.StatusConflict || !strings.Contains(string(body), "only workspace") {
-		t.Fatalf("%d %s", status, body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting call held up the shutdown")
 	}
 }

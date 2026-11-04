@@ -1,4 +1,4 @@
-// Package store keeps all hub state in a single SQLite file.
+// Package store keeps rooms, who is in them and what they said, in one SQLite file.
 package store
 
 import (
@@ -6,279 +6,125 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-// ErrNotFound is returned when a row does not exist or is not visible to the caller.
+// ErrNotFound means the room, member or session does not exist.
 var ErrNotFound = errors.New("not found")
 
-// ErrConflict is returned when a unique value such as a name is already taken.
-var ErrConflict = errors.New("already exists")
+// ErrRoomFull means a room has as many members as it can take.
+var ErrRoomFull = errors.New("room is full")
 
-// Store wraps the database. SQLite allows one writer at a time, and writers that compete
-// for the lock spend their time sleeping and retrying. So all writes share one connection,
-// and frequent small ones are grouped into a single commit by writeLoop. Reads run in
-// parallel on their own connections and never wait for a write.
+// MaxMembers caps how many names one room can have.
+const MaxMembers = 50
+
+const (
+	roomIdle    = 90 * 24 * time.Hour // a room nobody uses is deleted after this
+	sessionIdle = 30 * 24 * time.Hour
+	touchGap    = 15 * time.Second // presence is written at most this often
+)
+
+// Store wraps the database.
 type Store struct {
-	db     *sql.DB // reads
-	w      *sql.DB // writes, exactly one connection
-	writes chan writeOp
-	stop   chan struct{}
-	done   chan struct{}
-	demo   bool
+	db *sql.DB
 }
 
-type writeOp struct {
-	fn     func(*sql.Tx) error
-	result chan error
-}
+const schema = `
+CREATE TABLE rooms (
+	id         INTEGER PRIMARY KEY,
+	token_hash TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL,
+	active_at  INTEGER NOT NULL
+);
+-- A member is a name in a room. The name is the identity: whoever joins under it gets
+-- its unread messages, so a chat that restarts picks up where it left off.
+CREATE TABLE members (
+	id        INTEGER PRIMARY KEY,
+	room_id   INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+	name      TEXT NOT NULL,
+	joined_at INTEGER NOT NULL,
+	seen_at   INTEGER NOT NULL,
+	read_id   INTEGER NOT NULL DEFAULT 0,
+	UNIQUE (room_id, name)
+);
+-- Which member an MCP session speaks for.
+CREATE TABLE sessions (
+	id_hash   TEXT PRIMARY KEY,
+	member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+	seen_at   INTEGER NOT NULL
+);
+CREATE INDEX sessions_member ON sessions(member_id);
+-- One conversation per room. Names are copied in, so history stays readable after a member is removed.
+CREATE TABLE messages (
+	id         INTEGER PRIMARY KEY,
+	room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+	from_name  TEXT NOT NULL,
+	to_name    TEXT NOT NULL DEFAULT '',
+	body       TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX messages_room ON messages(room_id, id);
+`
 
-// maxBatch caps how many writes share one commit, so a burst cannot make it arbitrarily large.
-const maxBatch = 256
-
-// ErrClosed is returned for writes that arrive while the store shuts down.
-var ErrClosed = errors.New("store is closed")
-
-// SetDemo marks everything created from now on as demo data, except for admins.
-func (s *Store) SetDemo(on bool) {
-	s.demo = on
-}
-
-// Open opens or creates the database at path and applies pending migrations.
+// Open opens or creates the database at path.
 func Open(path string) (*Store, error) {
-	file := "file:" + filepath.ToSlash(path)
-	w, err := sql.Open("sqlite", file+
-		"?_pragma=busy_timeout(5000)"+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+
+		"?_pragma=busy_timeout(10000)"+
 		"&_pragma=auto_vacuum(INCREMENTAL)"+ // only takes effect on a new file, has to come first
 		"&_pragma=journal_mode(WAL)"+
-		"&_pragma=synchronous(FULL)"+ // an acknowledged message survives power loss
+		"&_pragma=synchronous(FULL)"+ // a message that was acknowledged survives a power cut
 		"&_pragma=foreign_keys(1)"+
-		"&_pragma=journal_size_limit(67108864)"+ // the WAL file shrinks back to 64 MB after a checkpoint
-		"&_pragma=cache_size(-8000)"+
-		"&_pragma=temp_store(MEMORY)"+
+		"&_pragma=temp_store(MEMORY)"+ // the container has no writable /tmp
 		"&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	w.SetMaxOpenConns(1)
-	w.SetMaxIdleConns(1)
-	// Readers only set what they need. The rest is stored in the file by the writer, and
-	// setting it again on each new connection can run into the write lock.
-	db, err := sql.Open("sqlite", file+
-		"?_pragma=busy_timeout(5000)"+
-		"&_pragma=cache_size(-8000)"+
-		"&_pragma=temp_store(MEMORY)")
-	if err != nil {
-		w.Close()
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(8) // reopening means running the pragmas again
-	s := &Store{db: db, w: w, writes: make(chan writeOp, maxBatch), stop: make(chan struct{}), done: make(chan struct{})}
-	// Touching the writer first creates the file with the right settings.
-	if err := w.PingContext(context.Background()); err != nil {
-		db.Close()
-		w.Close()
-		return nil, fmt.Errorf("database %s cannot be read, it may be damaged, restore a copy from the backups folder: %w", path, err)
-	}
-	if err := s.checkIntegrity(context.Background(), path); err != nil {
-		db.Close()
-		w.Close()
-		return nil, err
-	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	s := &Store{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
-		w.Close()
-		return nil, err
+		return nil, fmt.Errorf("database %s: %w", path, err)
 	}
-	go s.writeLoop()
 	return s, nil
 }
 
-// write runs fn inside a transaction shared with other waiting writes and returns once it
-// is durably committed. A lone write commits right away, under load many share one disk sync.
-// A cancelled caller stops waiting, but its write still happens: it may already be part of a
-// batch, and the other writes in there must not fail because of it.
-func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
-	op := writeOp{fn: fn, result: make(chan error, 1)}
-	select {
-	case s.writes <- op:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.stop:
-		return ErrClosed
+func (s *Store) migrate(ctx context.Context) error {
+	var check string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&check); err != nil {
+		return fmt.Errorf("cannot be read: %w", err)
 	}
-	select {
-	case err := <-op.result:
+	if check != "ok" {
+		return fmt.Errorf("is damaged: %s", check)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.done:
-		// The loop is gone and may have ended without seeing this write.
-		select {
-		case err := <-op.result:
-			return err
-		default:
-			return ErrClosed
-		}
 	}
+	if version >= 1 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (s *Store) writeLoop() {
-	defer close(s.done)
-	batch := make([]writeOp, 0, maxBatch)
-	for {
-		select {
-		case op := <-s.writes:
-			batch = append(batch[:0], op)
-		case <-s.stop:
-			s.failPending()
-			return
-		}
-	drain:
-		for len(batch) < maxBatch {
-			select {
-			case op := <-s.writes:
-				batch = append(batch, op)
-			default:
-				break drain
-			}
-		}
-		s.commit(batch)
-	}
-}
-
-func (s *Store) failPending() {
-	for {
-		select {
-		case op := <-s.writes:
-			op.result <- ErrClosed
-		default:
-			return
-		}
-	}
-}
-
-// commit runs a batch. Each write gets a savepoint, so one that fails is undone alone.
-func (s *Store) commit(batch []writeOp) {
-	ctx := context.Background()
-	results := make([]error, len(batch))
-	tx, err := s.w.BeginTx(ctx, nil)
-	if err == nil {
-		for i, op := range batch {
-			if _, err := tx.ExecContext(ctx, `SAVEPOINT op`); err != nil {
-				results[i] = err
-				continue
-			}
-			results[i] = op.fn(tx)
-			if results[i] != nil {
-				if _, err := tx.ExecContext(ctx, `ROLLBACK TO op`); err != nil {
-					results[i] = errors.Join(results[i], err)
-				}
-			}
-			if _, err := tx.ExecContext(ctx, `RELEASE op`); err != nil {
-				results[i] = errors.Join(results[i], err)
-			}
-		}
-		err = tx.Commit()
-	}
-	for i, op := range batch {
-		if err != nil {
-			results[i] = err
-		}
-		op.result <- results[i]
-	}
-}
-
-// checkIntegrity refuses to run on a damaged file. Serving from one would keep
-// writing to it and could make things worse, stopping leaves the choice to the operator.
-func (s *Store) checkIntegrity(ctx context.Context, path string) error {
-	var result string
-	if err := s.db.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
-		return fmt.Errorf("database %s cannot be read, it may be damaged, restore a copy from the backups folder: %w", path, err)
-	}
-	if result != "ok" {
-		return fmt.Errorf("database %s is damaged (%s), restore a copy from the backups folder", path, result)
-	}
-	return nil
-}
-
-// Backup writes a consistent copy of the live database to path. It goes through a
-// temporary file, so an interrupted backup never looks like a finished one.
-func (s *Store) Backup(ctx context.Context, path string) error {
-	tmp := path + ".tmp"
-	os.Remove(tmp)
-	// On a read connection, because copying a big file must not hold up writers.
-	if _, err := s.db.ExecContext(ctx, `VACUUM INTO ?`, tmp); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("back up database: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("back up database: %w", err)
-	}
-	return nil
-}
-
-// Maintain cleans up what nothing else removes, and gives freed space back to the
-// disk. It is meant to run about once an hour.
-func (s *Store) Maintain(ctx context.Context) error {
-	now := nowMillis()
-	steps := []struct {
-		query string
-		args  []any
-	}{
-		{`DELETE FROM sessions WHERE expires_at <= ?`, []any{now}},
-		{`DELETE FROM invites WHERE expires_at <= ? OR uses >= max_uses`, []any{now}},
-		{`DELETE FROM oauth_codes WHERE expires_at <= ?`, []any{now}},
-		{`DELETE FROM connections WHERE expires_at <= ?`, []any{now}},
-		// Every client registers itself anew, the ones that never finished signing in pile up.
-		{`DELETE FROM oauth_clients WHERE created_at < ?
-			AND NOT EXISTS (SELECT 1 FROM oauth_codes WHERE client_id = oauth_clients.id)`, []any{now - 24*60*60*1000}},
-		{`DELETE FROM chat_sessions WHERE last_seen_at < ?`, []any{now - 90*24*60*60*1000}},
-		// A room nobody used for a long time goes away, there is no owner to ask.
-		{`DELETE FROM workspaces WHERE id IN (SELECT workspace_id FROM rooms WHERE last_active_at < ?)`, []any{now - roomIdleLifetime}},
-		{`DELETE FROM users WHERE room = 1 AND NOT EXISTS (SELECT 1 FROM rooms WHERE rooms.user_id = users.id)`, nil},
-		// A chat's agent that nobody used for a month goes away. Opening that project again makes a new one.
-		{`UPDATE agents SET revoked_at = ?, token_hash = NULL WHERE auto = 1 AND revoked_at IS NULL
-			AND COALESCE(last_seen_at, created_at) < ?`, []any{now, now - 30*24*60*60*1000}},
-		// Retry keys only matter for minutes, a day is generous.
-		{`UPDATE messages SET client_key = NULL WHERE client_key IS NOT NULL AND created_at < ?`, []any{now - 24*60*60*1000}},
-		// A revoked agent stays while history still names it, then it can go.
-		{`DELETE FROM agents WHERE revoked_at IS NOT NULL
-			AND NOT EXISTS (SELECT 1 FROM messages WHERE from_agent_id = agents.id)
-			AND NOT EXISTS (SELECT 1 FROM messages WHERE to_agent_id = agents.id)`, nil},
-		{`PRAGMA optimize`, nil},
-		{`PRAGMA incremental_vacuum(2000)`, nil},
-		{`PRAGMA wal_checkpoint(TRUNCATE)`, nil},
-	}
-	for _, step := range steps {
-		// A query rather than an exec, because the pragmas return rows and
-		// incremental_vacuum only does its work as those rows are read.
-		rows, err := s.w.QueryContext(ctx, step.query, step.args...)
-		if err != nil {
-			return fmt.Errorf("maintenance: %w", err)
-		}
-		for rows.Next() {
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return fmt.Errorf("maintenance: %w", err)
-		}
-	}
-	return nil
-}
-
-// Close finishes running writes and releases the database.
+// Close closes the database.
 func (s *Store) Close() error {
-	close(s.stop)
-	<-s.done
-	return errors.Join(s.w.Close(), s.db.Close())
+	return s.db.Close()
 }
 
 // Ping checks that the database answers.
@@ -286,35 +132,7 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.w.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
-		return fmt.Errorf("create schema_version: %w", err)
-	}
-	var current int
-	if err := s.w.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&current); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
-	}
-	for i := current; i < len(migrations); i++ {
-		tx, err := s.w.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("migration %d: %w", i+1, err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, i+1); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("record migration %d: %w", i+1, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func nowMillis() int64 {
+func now() int64 {
 	return time.Now().UnixMilli()
 }
 
@@ -325,10 +143,307 @@ func rowErr(err error) error {
 	return err
 }
 
-// nullMillis converts a nullable millisecond column to a plain value, zero meaning unset.
-func nullMillis(v sql.NullInt64) int64 {
-	if v.Valid {
-		return v.Int64
+// Room is a shared conversation entered with a link.
+type Room struct {
+	ID int64
+}
+
+// CreateRoom stores a room under the hash of its link token.
+func (s *Store) CreateRoom(ctx context.Context, tokenHash string) (*Room, error) {
+	t := now()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO rooms (token_hash, created_at, active_at) VALUES (?, ?, ?)`, tokenHash, t, t)
+	if err != nil {
+		return nil, err
 	}
-	return 0
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &Room{ID: id}, nil
+}
+
+// RoomByToken finds a room by the hash of its link token.
+func (s *Store) RoomByToken(ctx context.Context, tokenHash string) (*Room, error) {
+	var r Room
+	var active int64
+	err := s.db.QueryRowContext(ctx, `SELECT id, active_at FROM rooms WHERE token_hash = ?`, tokenHash).Scan(&r.ID, &active)
+	if err != nil {
+		return nil, rowErr(err)
+	}
+	if t := now(); t-active > time.Hour.Milliseconds() {
+		if _, err := s.db.ExecContext(ctx, `UPDATE rooms SET active_at = ? WHERE id = ?`, t, r.ID); err != nil {
+			return nil, err
+		}
+	}
+	return &r, nil
+}
+
+// DeleteRoom removes a room with everyone and everything in it.
+func (s *Store) DeleteRoom(ctx context.Context, roomID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM rooms WHERE id = ?`, roomID)
+	return err
+}
+
+// Member is a name in a room.
+type Member struct {
+	ID     int64  `json:"-"`
+	RoomID int64  `json:"-"`
+	Name   string `json:"name"`
+	SeenAt int64  `json:"seen_at"`
+	ReadID int64  `json:"-"`
+}
+
+const memberColumns = `id, room_id, name, seen_at, read_id`
+
+func scanMember(row interface{ Scan(...any) error }) (*Member, error) {
+	var m Member
+	if err := row.Scan(&m.ID, &m.RoomID, &m.Name, &m.SeenAt, &m.ReadID); err != nil {
+		return nil, rowErr(err)
+	}
+	return &m, nil
+}
+
+// Join makes a session speak as name in a room. An existing name is taken over with its unread
+// messages. A new one starts reading from now, earlier messages are in the history.
+func (s *Store) Join(ctx context.Context, roomID int64, sessionHash, name string) (m *Member, created bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+	t := now()
+	m, err = scanMember(tx.QueryRowContext(ctx, `SELECT `+memberColumns+` FROM members WHERE room_id = ? AND name = ?`, roomID, name))
+	if errors.Is(err, ErrNotFound) {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM members WHERE room_id = ?`, roomID).Scan(&n); err != nil {
+			return nil, false, err
+		}
+		if n >= MaxMembers {
+			return nil, false, ErrRoomFull
+		}
+		var last int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM messages WHERE room_id = ?`, roomID).Scan(&last); err != nil {
+			return nil, false, err
+		}
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO members (room_id, name, joined_at, seen_at, read_id) VALUES (?, ?, ?, ?, ?)`, roomID, name, t, t, last)
+		if err != nil {
+			return nil, false, err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return nil, false, err
+		}
+		m = &Member{ID: id, RoomID: roomID, Name: name, SeenAt: t, ReadID: last}
+		created = true
+	} else if err != nil {
+		return nil, false, err
+	} else if _, err := tx.ExecContext(ctx, `UPDATE members SET seen_at = ? WHERE id = ?`, t, m.ID); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sessions (id_hash, member_id, seen_at) VALUES (?, ?, ?)
+		ON CONFLICT(id_hash) DO UPDATE SET member_id = excluded.member_id, seen_at = excluded.seen_at`,
+		sessionHash, m.ID, t); err != nil {
+		return nil, false, err
+	}
+	return m, created, tx.Commit()
+}
+
+// SessionMember finds who a session speaks for, and notes that it is still around.
+func (s *Store) SessionMember(ctx context.Context, sessionHash string) (*Member, error) {
+	var seen int64
+	var m Member
+	err := s.db.QueryRowContext(ctx, `
+		SELECT m.id, m.room_id, m.name, m.seen_at, m.read_id, s.seen_at
+		FROM sessions s JOIN members m ON m.id = s.member_id WHERE s.id_hash = ?`, sessionHash).
+		Scan(&m.ID, &m.RoomID, &m.Name, &m.SeenAt, &m.ReadID, &seen)
+	if err != nil {
+		return nil, rowErr(err)
+	}
+	t := now()
+	if t-m.SeenAt > touchGap.Milliseconds() {
+		if _, err := s.db.ExecContext(ctx, `UPDATE members SET seen_at = ? WHERE id = ?`, t, m.ID); err != nil {
+			return nil, err
+		}
+		m.SeenAt = t
+	}
+	if t-seen > time.Hour.Milliseconds() {
+		if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET seen_at = ? WHERE id_hash = ?`, t, sessionHash); err != nil {
+			return nil, err
+		}
+	}
+	return &m, nil
+}
+
+// EndSession forgets a session, for clients that say goodbye. The member stays.
+func (s *Store) EndSession(ctx context.Context, sessionHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id_hash = ?`, sessionHash)
+	return err
+}
+
+// Members lists a room's members, by name.
+func (s *Store) Members(ctx context.Context, roomID int64) ([]Member, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+memberColumns+` FROM members WHERE room_id = ? ORDER BY name`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Member{}
+	for rows.Next() {
+		m, err := scanMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// RemoveMember takes a name out of a room. A chat still using it is out of the room until it joins again.
+func (s *Store) RemoveMember(ctx context.Context, roomID int64, name string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM members WHERE room_id = ? AND name = ?`, roomID, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Message is one thing said in a room. To is empty when it is meant for everyone.
+type Message struct {
+	ID   int64  `json:"id"`
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	Body string `json:"text"`
+	At   int64  `json:"at"`
+}
+
+const messageColumns = `id, from_name, to_name, body, created_at`
+
+func scanMessages(rows *sql.Rows) ([]Message, error) {
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.From, &m.To, &m.Body, &m.At); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// Post adds a message to a room.
+func (s *Store) Post(ctx context.Context, roomID int64, from, to, body string) (*Message, error) {
+	m := &Message{From: from, To: to, Body: body, At: now()}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (room_id, from_name, to_name, body, created_at) VALUES (?, ?, ?, ?, ?)`, roomID, from, to, body, m.At)
+	if err != nil {
+		return nil, err
+	}
+	if m.ID, err = res.LastInsertId(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// Unread returns what others said since a member last read, oldest first, and moves the member's
+// read position past it.
+func (s *Store) Unread(ctx context.Context, m *Member, limit int) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+messageColumns+` FROM messages
+		WHERE room_id = ? AND id > ? AND from_name <> ? ORDER BY id LIMIT ?`, m.RoomID, m.ReadID, m.Name, limit)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanMessages(rows)
+	if err != nil || len(out) == 0 {
+		return out, err
+	}
+	last := out[len(out)-1].ID
+	if _, err := s.db.ExecContext(ctx, `UPDATE members SET read_id = ? WHERE id = ? AND read_id < ?`, last, m.ID, last); err != nil {
+		return nil, err
+	}
+	m.ReadID = last
+	return out, nil
+}
+
+// CountUnread counts what others said since a member last read, and how much of it names the member.
+func (s *Store) CountUnread(ctx context.Context, m *Member) (all, forMe int, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(to_name = ?), 0) FROM messages
+		WHERE room_id = ? AND id > ? AND from_name <> ?`, m.Name, m.RoomID, m.ReadID, m.Name).Scan(&all, &forMe)
+	return all, forMe, err
+}
+
+// History returns up to limit messages before beforeID, or the newest when it is 0, oldest first.
+func (s *Store) History(ctx context.Context, roomID, beforeID int64, limit int) ([]Message, error) {
+	query := `SELECT ` + messageColumns + ` FROM messages WHERE room_id = ?`
+	args := []any{roomID}
+	if beforeID > 0 {
+		query += ` AND id < ?`
+		args = append(args, beforeID)
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY id DESC LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// After returns up to limit messages after afterID, oldest first.
+func (s *Store) After(ctx context.Context, roomID, afterID int64, limit int) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+messageColumns+` FROM messages
+		WHERE room_id = ? AND id > ? ORDER BY id LIMIT ?`, roomID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanMessages(rows)
+}
+
+// Search finds messages in a room that contain all of the words, newest first.
+func (s *Store) Search(ctx context.Context, roomID int64, words []string, limit int) ([]Message, error) {
+	query := `SELECT ` + messageColumns + ` FROM messages WHERE room_id = ?`
+	args := []any{roomID}
+	for _, w := range words {
+		query += ` AND body LIKE ? ESCAPE '\'`
+		args = append(args, "%"+likeEscaper.Replace(w)+"%")
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY id DESC LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	return scanMessages(rows)
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// Clean deletes rooms nobody used for a long time and sessions that went quiet, then gives
+// freed space back to the disk. It is meant to run about once an hour.
+func (s *Store) Clean(ctx context.Context) error {
+	t := now()
+	steps := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM rooms WHERE active_at < ?`, []any{t - roomIdle.Milliseconds()}},
+		{`DELETE FROM sessions WHERE seen_at < ?`, []any{t - sessionIdle.Milliseconds()}},
+		{`PRAGMA optimize`, nil},
+		{`PRAGMA incremental_vacuum`, nil},
+		{`PRAGMA wal_checkpoint(TRUNCATE)`, nil},
+	}
+	for _, step := range steps {
+		if _, err := s.db.ExecContext(ctx, step.query, step.args...); err != nil {
+			return fmt.Errorf("%s: %w", step.query, err)
+		}
+	}
+	return nil
 }
